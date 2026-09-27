@@ -15,7 +15,8 @@
 #   Mods/ClusterIntegration/force_install.txt exists on the SD card.
 # - Marker files next to the Update/ folder on the SD card:
 #     force_install.txt   skip the OEM / firmware gate
-#     diag.txt            hook logs only, no cluster service injected
+#     diag.txt            hook logs only, no cluster service injected,
+#                         installed config set to turn-by-turn only
 #     enable_carplay.txt  install the CarPlay (dio_manager) hook on Audi
 #     uninstall.txt       ModKit convention: run uninstall.sh instead
 # - Copies JAR, cluster, gal_cluster.so, dio_cluster.so to their target dirs.
@@ -116,6 +117,34 @@ if [[ ! -d "$APPS_DIR" ]]; then
 fi
 if [[ ! -f "$APPS_DIR/gal" && ! -f "$APPS_DIR/gal.real" ]]; then
     print "WARN: $APPS_DIR/gal not found. Android Auto cluster video hook cannot be installed on this unit; BAP turn-by-turn (JAR) will still be installed."
+fi
+
+# The mod's Java classes shadow the stock AndroidAuto2Subsystem and construct
+# de.audi.app.car.adi.legacy.sportchrono.StorageMountHandler ("Sport Chrono"
+# is a Porsche feature). If no HMI jar on this unit contains that class the
+# shadowed subsystem dies with NoClassDefFoundError and Android Auto stops
+# working. Jar directories are stored uncompressed, so grep -a finds the
+# class path. Porsche: informational. Audi: abort unless forced.
+check_hmi_class() {
+    typeset cls hits
+    cls="de/audi/app/car/adi/legacy/sportchrono/StorageMountHandler.class"
+    hits="$(find "$JAR_DIR" -name '*.jar' 2>/dev/null | grep -v '/ClusterIntegration_' | while read j; do
+        if grep -a -q -- "$cls" "$j" 2>/dev/null; then print "${j##*/}"; fi
+    done | head -3 | tr '\n' ' ')"
+    if [[ -n "$hits" ]]; then
+        print "hmi class check:   StorageMountHandler found in: $hits"
+        return 0
+    fi
+    print "hmi class check:   StorageMountHandler NOT found in any jar under $JAR_DIR"
+    return 1
+}
+if ! check_hmi_class; then
+    if [[ "$OEM" == "AU" && $FORCE_INSTALL -eq 0 ]]; then
+        print "The mod's Java classes link against that Porsche-side class; installing would most likely break Android Auto on this unit."
+        print "Aborting before any change. Create Mods/ClusterIntegration/force_install.txt to install anyway (rollback is available)."
+        exit 0
+    fi
+    print "WARNING: continuing anyway (OEM=$OEM force=$FORCE_INSTALL)."
 fi
 
 BACKUP_DIR="$MOD_PATH/Backup"
@@ -249,6 +278,25 @@ NEW_JAR="$(ls -1t "$MOD_PATH"/ClusterIntegration_*.jar 2>/dev/null | head -1)"
     exit 3
 }
 
+# Java classes: on Audi without enable_carplay.txt install the Android-Auto-
+# only JAR (Update/aa_only/*_aa.jar, built by modkit/build_sd_package.sh). It
+# lacks the CarPlay classes, so the stock CarPlayDSIManager stays in charge
+# of CarPlay and only AndroidAuto2Subsystem is shadowed. The full JAR is used
+# on Porsche and on Audi with enable_carplay.txt.
+CARPLAY_HOOK=1
+[[ "$OEM" == "AU" && ! -e "$MOD_ROOT/enable_carplay.txt" ]] && CARPLAY_HOOK=0
+if [[ $CARPLAY_HOOK -eq 0 ]]; then
+    AA_JAR="$(ls -1t "$MOD_PATH"/aa_only/ClusterIntegration_*_aa.jar 2>/dev/null | head -1)"
+    if [[ -n "$AA_JAR" && -f "$AA_JAR" ]]; then
+        NEW_JAR="$AA_JAR"
+        print "java classes:      Android Auto only (${NEW_JAR##*/}; CarPlay classes not installed)"
+    else
+        print "WARN: aa_only/ClusterIntegration_*_aa.jar not found, installing the full JAR (CarPlay classes included)"
+    fi
+else
+    print "java classes:      full JAR (${NEW_JAR##*/})"
+fi
+
 # Remove any older versions of our jar so only the new one remains.
 typeset j
 for j in "$JAR_DIR"/ClusterIntegration_* "$JAR_DIR"/AndroidAutoCluster_*; do
@@ -283,7 +331,7 @@ swap_binary_for_wrapper gal
 # Porsche-derived object layouts, so on an untested unit it is risk without
 # benefit for an Android Auto user. Without the marker any earlier wrapper is
 # restored so the unit runs the stock dio_manager.
-if [[ "$OEM" != "AU" || -e "$MOD_ROOT/enable_carplay.txt" ]]; then
+if [[ $CARPLAY_HOOK -eq 1 ]]; then
     swap_binary_for_wrapper dio_manager
     print "carplay hook:      ON"
 else
@@ -310,7 +358,43 @@ if [[ -e "$MOD_ROOT/diag.txt" ]]; then
     if [[ ! -f "$DIAG_MARKER" ]]; then
         : > "$DIAG_MARKER" && chmod 644 "$DIAG_MARKER" && note "add $DIAG_MARKER"
     fi
+    # Also switch the installed config to BAP-only ("enableMapRender": false):
+    # with the cluster service not injected there is no video to show, and
+    # an empty cluster window must not be posted over the native map. The
+    # next non-diag run reinstalls the shipped config (install_file sees the
+    # difference, backs this copy up and overwrites it).
+    if sed -e 's/"enableMapRender"[ ]*:[ ]*true/"enableMapRender": false/' "$MOD_PATH/cluster_config.json" > "$CLUSTER_DIR/cluster_config.json.diag" 2>/dev/null \
+       && grep -q '"enableMapRender": false' "$CLUSTER_DIR/cluster_config.json.diag"; then
+        mv -f "$CLUSTER_DIR/cluster_config.json.diag" "$CLUSTER_DIR/cluster_config.json"
+        chmod 644 "$CLUSTER_DIR/cluster_config.json" 2>/dev/null
+        note "replace $CLUSTER_DIR/cluster_config.json diag=enableMapRender:false"
+        print "diag mode:         installed cluster_config.json has enableMapRender=false (turn-by-turn only)"
+    else
+        rm -f "$CLUSTER_DIR/cluster_config.json.diag"
+        print "diag mode:         WARN could not rewrite cluster_config.json; video path left enabled"
+    fi
     print "diag mode:         ON  ($DIAG_MARKER) - hook logs only, cluster service NOT injected"
+    # Stage the stock HMI jars that contain the classes this mod shadows, so
+    # constructor signatures can be compared on a PC with javap
+    # (modkit/check_hmi_signatures.sh) before going live.
+    REF_DIR="$BACKUP_DIR/hmi_reference"
+    mkdir -p "$REF_DIR" 2>/dev/null
+    typeset refcls refjar refn
+    refn=0
+    for refcls in \
+        de/audi/app/terminalmode/smartphone/androidauto2/AndroidAuto2Subsystem.class \
+        de/audi/app/terminalmode/smartphone/carplay/CarPlayDSIManager.class \
+    ; do
+        find "$JAR_DIR" -name '*.jar' 2>/dev/null | grep -v '/ClusterIntegration_' | while read refjar; do
+            if grep -a -q -- "$refcls" "$refjar" 2>/dev/null; then
+                if [[ ! -f "$REF_DIR/${refjar##*/}" ]]; then
+                    cp -p "$refjar" "$REF_DIR/${refjar##*/}" && print "hmi reference:     ${refjar##*/} -> Backup/hmi_reference/ (contains ${refcls##*/})"
+                fi
+            fi
+        done
+    done
+    refn="$(ls -1 "$REF_DIR" 2>/dev/null | wc -l | awk '{print $1}')"
+    print "hmi reference:     $refn stock jar(s) staged for modkit/check_hmi_signatures.sh"
 else
     if [[ -f "$DIAG_MARKER" ]]; then
         rm -f "$DIAG_MARKER" && note "remove $DIAG_MARKER"
