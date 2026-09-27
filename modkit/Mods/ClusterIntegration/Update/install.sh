@@ -17,7 +17,9 @@
 #     force_install.txt   skip the OEM / firmware gate
 #     diag.txt            hook logs only, no cluster service injected,
 #                         installed config set to turn-by-turn only
-#     enable_carplay.txt  install the CarPlay (dio_manager) hook on Audi
+#     enable_carplay.txt  install the CarPlay hook and full JAR on Audi
+#     config_overrides.txt  key=value lines applied to the installed
+#                         cluster_config.json "config" block (e.g. forceRHD=true)
 #     uninstall.txt       ModKit convention: run uninstall.sh instead
 # - Copies JAR, cluster, gal_cluster.so, dio_cluster.so to their target dirs.
 # - Skips copies when the target file is byte-identical to the source.
@@ -41,7 +43,8 @@ export MOD_PATH="${modPath:-${MOD_PATH:-}}"
 [[ ! -e /mnt/app ]] && mount -t qnx6 /dev/mnanda0t177.1 /mnt/app
 mount -uw /mnt/app/
 
-# ex: MH2p_US_PO416_P2870 (Porsche), MH2p_ER_AUG36_P0xxx (Audi)
+# ex: MH2p_US_PO416_P2870 (Porsche), MH2p_ER_AUG35_P2873 (Audi e-tron),
+#     MH2p_ER_AU_P2873 (Audi units without a TYPE code, e.g. Q3/A1)
 export RELEASE_VERSION=`/mnt/app/armle/usr/bin/pc b:46924065:401 | cut -c 61- | sed ':a;N;$!ba;s/\n//g' | sed -e 's/\.//g' | sed -e 's/ //g'`
 # AS, CN, ER, US, ...
 export REGION="$(echo $RELEASE_VERSION | cut -d'_' -f2)"
@@ -63,21 +66,29 @@ print "Head unit:         release=$RELEASE_VERSION oem=$OEM type=$TYPE region=$R
 
 # Supported head units:
 #   PO  Porsche PCM5 (MH2P) firmware 26xx / 28xx     - tested
-#   AU  Audi MH2p firmware 26xx / 28xx               - EXPERIMENTAL
-#       (known Audi string: MH2p_ER_AUG35_P2873, e-tron 55 quattro, EU)
+#   AU  Audi MH2p firmware 26xx / 27xx / 28xx        - EXPERIMENTAL
+#       Firmware build numbers are one VAG-wide counter. Public e-tron GE
+#       strings are AUG35 P2711 / P2718 / K2716_1 / P2873; P2873 sits in the
+#       same build window as the Porsche P2870/P2874 the hooks were built
+#       against and is the best-case target. MY2021+ e-tron is MIB3 (3xxx)
+#       and out of scope.
 # Anything else aborts unless force_install.txt is present.
 case "$OEM" in
     PO|AU)
         if [[ "$OEM" == "PO" ]]; then
-            brand="Porsche"
+            brand="Porsche"; range="26xx / 28xx"
+            in_range=0
+            [[ "$SOFTWARE_VERSION" == 26?? || "$SOFTWARE_VERSION" == 28?? ]] && in_range=1
         else
-            brand="Audi"
+            brand="Audi"; range="26xx / 27xx / 28xx"
+            in_range=0
+            [[ "$SOFTWARE_VERSION" == 26?? || "$SOFTWARE_VERSION" == 27?? || "$SOFTWARE_VERSION" == 28?? ]] && in_range=1
         fi
-        if [[ "$SOFTWARE_VERSION" != 26?? && "$SOFTWARE_VERSION" != 28?? ]]; then
+        if [[ $in_range -eq 0 ]]; then
             if [[ $FORCE_INSTALL -eq 1 ]]; then
-                print "WARNING: $brand firmware $RELEASE_VERSION outside tested range (26xx / 28xx), continuing because force_install.txt is present."
+                print "WARNING: $brand firmware $RELEASE_VERSION outside tested range ($range), continuing because force_install.txt is present."
             else
-                print "Firmware $RELEASE_VERSION not in supported range (26xx / 28xx). Aborting."
+                print "Firmware $RELEASE_VERSION not in supported range ($range). Aborting."
                 print "To override, create Mods/ClusterIntegration/force_install.txt on the SD card."
                 exit 0
             fi
@@ -323,6 +334,50 @@ chmod 755 "$CLUSTER_DIR/gal_cluster.so" 2>/dev/null
 chmod 755 "$CLUSTER_DIR/dio_cluster.so" 2>/dev/null
 chmod 644 "$CLUSTER_DIR/cluster_config.json" 2>/dev/null
 
+# Per-car config overrides. Mods/ClusterIntegration/config_overrides.txt on
+# the SD card holds "key=value" lines (value written as JSON: true, false,
+# a number, or "a string"; '#' starts a comment). Each key is replaced in
+# the top-level "config" block of the installed cluster_config.json only
+# (scalar keys such as forceRHD, forceImperial, imperialSmallUnit,
+# bargraphMode, enableMapRender, aaClusterMode, heartbeatInterval). Nested
+# objects (mirror, gal_h264) and carConfig entries are not touched; use the
+# SD-card override file /fs/sda0/cluster_config.json for those. Re-running
+# without the file reinstalls the shipped config.
+OVERRIDES="$MOD_ROOT/config_overrides.txt"
+if [[ -f "$OVERRIDES" ]]; then
+    cfg="$CLUSTER_DIR/cluster_config.json"
+    grep -v '^[ 	]*#' "$OVERRIDES" | grep '=' | while IFS='=' read -r k v; do
+        k="$(print -r -- "$k" | sed -e 's/^[ 	]*//' -e 's/[ 	]*$//')"
+        v="$(print -r -- "$v" | sed -e 's/^[ 	]*//' -e 's/[ 	]*$//')"
+        [[ -z "$k" || -z "$v" ]] && continue
+        if awk -v key="$k" -v val="$v" '
+            BEGIN { inblk = 0; done = 0 }
+            /"config"[ \t]*:[ \t]*\{/ { inblk = 1 }
+            inblk && !done {
+                pat = "\"" key "\"[ \t]*:[ \t]*[^,}]*"
+                if (match($0, pat)) {
+                    old = substr($0, RSTART, RLENGTH)
+                    sub(/^"[^"]*"[ \t]*:[ \t]*/, "", old)
+                    if (old !~ /^[\[{]/) {
+                        $0 = substr($0, 1, RSTART - 1) "\"" key "\": " val substr($0, RSTART + RLENGTH)
+                        done = 1
+                    }
+                }
+            }
+            inblk && /^[ \t]*\},?[ \t]*$/ { inblk = 0 }
+            { print }
+            END { if (!done) exit 3 }
+        ' "$cfg" > "$cfg.ovr"; then
+            mv -f "$cfg.ovr" "$cfg" && chmod 644 "$cfg" 2>/dev/null
+            print "config override:   $k = $v"
+            note "override $cfg $k=$v"
+        else
+            rm -f "$cfg.ovr"
+            print "config override:   WARN '$k' is not a scalar key of the config block, ignored"
+        fi
+    done
+fi
+
 swap_binary_for_wrapper gal
 
 # CarPlay hook (dio_manager wrapper + dio_cluster.so). On Porsche it is always
@@ -363,7 +418,7 @@ if [[ -e "$MOD_ROOT/diag.txt" ]]; then
     # an empty cluster window must not be posted over the native map. The
     # next non-diag run reinstalls the shipped config (install_file sees the
     # difference, backs this copy up and overwrites it).
-    if sed -e 's/"enableMapRender"[ ]*:[ ]*true/"enableMapRender": false/' "$MOD_PATH/cluster_config.json" > "$CLUSTER_DIR/cluster_config.json.diag" 2>/dev/null \
+    if sed -e 's/"enableMapRender"[ ]*:[ ]*true/"enableMapRender": false/' "$CLUSTER_DIR/cluster_config.json" > "$CLUSTER_DIR/cluster_config.json.diag" 2>/dev/null \
        && grep -q '"enableMapRender": false' "$CLUSTER_DIR/cluster_config.json.diag"; then
         mv -f "$CLUSTER_DIR/cluster_config.json.diag" "$CLUSTER_DIR/cluster_config.json"
         chmod 644 "$CLUSTER_DIR/cluster_config.json" 2>/dev/null
