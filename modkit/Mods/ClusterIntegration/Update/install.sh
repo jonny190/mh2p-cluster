@@ -10,6 +10,9 @@
 # install.sh 
 #
 # Idempotent installer. Re-runs are safe.
+# - Supported head units: Porsche PCM5 (OEM=PO, firmware 26xx/28xx, tested)
+#   and Audi MH2p (OEM=AU, experimental). Other OEMs abort unless
+#   Mods/ClusterIntegration/force_install.txt exists on the SD card.
 # - Copies JAR, cluster, gal_cluster.so, dio_cluster.so to their target dirs.
 # - Skips copies when the target file is byte-identical to the source.
 # - Backs up any existing target before overwriting (timestamped, into
@@ -29,23 +32,78 @@ export MOD_PATH="${modPath:-${MOD_PATH:-}}"
 [[ ! -e /mnt/app ]] && mount -t qnx6 /dev/mnanda0t177.1 /mnt/app
 mount -uw /mnt/app/
 
+# ex: MH2p_US_PO416_P2870 (Porsche), MH2p_ER_AUG36_P0xxx (Audi)
 export RELEASE_VERSION=`/mnt/app/armle/usr/bin/pc b:46924065:401 | cut -c 61- | sed ':a;N;$!ba;s/\n//g' | sed -e 's/\.//g' | sed -e 's/ //g'`
+# AS, CN, ER, US, ...
+export REGION="$(echo $RELEASE_VERSION | cut -d'_' -f2)"
+# VW, AU, PO, LB, ...
 export OEM="$(echo $RELEASE_VERSION | cut -d'_' -f3 | cut -b -2)"
+# 416, 636, G33, G35, G36, ...
+export TYPE="$(echo $RELEASE_VERSION | cut -d'_' -f3 | cut -b 3-)"
+# 9830, 2870, ...
 export SOFTWARE_VERSION="$(echo $RELEASE_VERSION | cut -d'_' -f4 | cut -b 2-)"
 
-if [ "$OEM" != "PO" ]; then
-    print "Not a Porsche head unit (OEM=$OEM). Aborting."
-    exit 0
-fi
-if [[ "$SOFTWARE_VERSION" != 26?? && "$SOFTWARE_VERSION" != 28?? ]]; then
-    print "Firmware $RELEASE_VERSION not in supported range (26xx / 28xx)."
-    exit 0
-fi
-print "Porsche firmware $RELEASE_VERSION OK, installing..."
+# Override marker. Create Mods/ClusterIntegration/force_install.txt on the
+# SD card (next to the Update/ folder) to skip the OEM / firmware gate.
+# Only for people who know their head unit is MH2p and accept the risk.
+MOD_ROOT="${MOD_PATH%/*}"
+FORCE_INSTALL=0
+[[ -e "$MOD_ROOT/force_install.txt" ]] && FORCE_INSTALL=1
+
+print "Head unit:         release=$RELEASE_VERSION oem=$OEM type=$TYPE region=$REGION sw=$SOFTWARE_VERSION force=$FORCE_INSTALL"
+
+# Supported head units:
+#   PO  Porsche PCM5 (MH2P) firmware 26xx / 28xx     - tested
+#   AU  Audi MH2p (e.g. e-tron GE, A6 C8, Q8)         - EXPERIMENTAL, untested
+# Anything else aborts unless force_install.txt is present.
+case "$OEM" in
+    PO)
+        if [[ "$SOFTWARE_VERSION" != 26?? && "$SOFTWARE_VERSION" != 28?? ]]; then
+            if [[ $FORCE_INSTALL -eq 1 ]]; then
+                print "WARNING: Porsche firmware $RELEASE_VERSION outside tested range (26xx / 28xx), continuing because force_install.txt is present."
+            else
+                print "Firmware $RELEASE_VERSION not in supported range (26xx / 28xx). Aborting."
+                print "To override, create Mods/ClusterIntegration/force_install.txt on the SD card."
+                exit 0
+            fi
+        else
+            print "Porsche firmware $RELEASE_VERSION OK, installing..."
+        fi
+        ;;
+    AU)
+        print "Audi MH2p head unit $RELEASE_VERSION detected. Audi support is EXPERIMENTAL."
+        print "No Audi firmware range has been validated yet, so the Porsche 26xx/28xx check is skipped."
+        print "If Android Auto or CarPlay stop working: put uninstall.txt in Mods/ClusterIntegration/ and re-run the ModKit."
+        ;;
+    *)
+        if [[ $FORCE_INSTALL -eq 1 ]]; then
+            print "WARNING: unsupported head unit (OEM='$OEM', release='$RELEASE_VERSION'), continuing because force_install.txt is present."
+        else
+            print "Unsupported head unit (OEM='$OEM', release='$RELEASE_VERSION'). Aborting."
+            print "Supported: Porsche (PO) firmware 26xx/28xx, Audi (AU, experimental)."
+            print "To override, create Mods/ClusterIntegration/force_install.txt on the SD card."
+            exit 0
+        fi
+        ;;
+esac
 
 JAR_DIR=/mnt/app/eso/hmi/lsd/jars
 CLUSTER_DIR=/mnt/app/eso/bin/apps/cluster
 APPS_DIR=/mnt/app/eso/bin/apps
+
+# Preflight: refuse to touch anything if the MH2p layout we expect is not
+# there. Protects against running on a head unit whose /mnt/app differs.
+if [[ ! -d "$JAR_DIR" ]]; then
+    print -u2 "ERROR: $JAR_DIR not found. This does not look like an MH2p HMI layout. Aborting before any change."
+    exit 4
+fi
+if [[ ! -d "$APPS_DIR" ]]; then
+    print -u2 "ERROR: $APPS_DIR not found. This does not look like an MH2p HMI layout. Aborting before any change."
+    exit 4
+fi
+if [[ ! -f "$APPS_DIR/gal" && ! -f "$APPS_DIR/gal.real" ]]; then
+    print "WARN: $APPS_DIR/gal not found. Android Auto cluster video hook cannot be installed on this unit; BAP turn-by-turn (JAR) will still be installed."
+fi
 
 BACKUP_DIR="$MOD_PATH/Backup"
 mkdir -p "$BACKUP_DIR" || { print -u2 "ERROR: cannot mkdir $BACKUP_DIR"; exit 2; }

@@ -26,10 +26,10 @@ mount -uw /mnt/app/
 export RELEASE_VERSION=`/mnt/app/armle/usr/bin/pc b:46924065:401 | cut -c 61- | sed ':a;N;$!ba;s/\n//g' | sed -e 's/\.//g' | sed -e 's/ //g'`
 export OEM="$(echo $RELEASE_VERSION | cut -d'_' -f3 | cut -b -2)"
 
-if [ "$OEM" != "PO" ]; then
-    print "Not a Porsche head unit (OEM=$OEM). Nothing to do."
-    exit 0
-fi
+# No OEM gate on uninstall: every step below only restores or removes files
+# this mod created (gal.real / dio_manager.real, our JAR, our cluster dir),
+# so it is safe on Porsche, Audi, or any unit where the mod was forced in.
+print "Head unit:         release=$RELEASE_VERSION oem=$OEM"
 
 JAR_DIR=/mnt/app/eso/hmi/lsd/jars
 CLUSTER_DIR=/mnt/app/eso/bin/apps/cluster
