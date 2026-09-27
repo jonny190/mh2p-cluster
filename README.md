@@ -63,7 +63,7 @@ All platform services are injected via setters after construction:
 |---|---|
 | `CombiBAPServiceNavi` | BAP cluster output — maneuver, distance, RGStatus, destination |
 | `ISysServices` | Unit system detection, car clock, car type/variant detection |
-| `ICarCoreServices` | Drive-side detection via `exteriorLight().leftHandTraffic()` |
+| `ICarCoreServices` | Drive-side detection via `configuration().airConditionMaster().driverSideLeft()` |
 | `StorageMountHandler` | Remounts USB/SD R/W for external log writing |
 | `ICarStatisticsService` | Injected but not currently used in active code |
 
@@ -101,7 +101,7 @@ A daemon timer fires every `heartbeatInterval` ms (default 2000ms) while navigat
 | Priority | Units | Drive side |
 |---|---|---|
 | 1 (highest) | `forceImperial` config flag | `forceRHD` config flag |
-| 2 | `ISysServices.units().distance().setting()` (1=km, 2=mi) | `ICarCoreServices.exteriorLight().leftHandTraffic()` |
+| 2 | `ISysServices.units().distance().setting()` (1=km, 2=mi) | `ICarCoreServices.configuration().airConditionMaster().driverSideLeft()` |
 | 3 | JSON `countries` table via locale/system properties | JSON `countries` table `rhd` field |
 | 4 (default) | Metric | LHD |
 
@@ -136,7 +136,7 @@ Two parallel log files: **plain** (full road names) and **hashed** (road names, 
 > **Warning:** This modifies Java files on your PCM5/MH2P unit. Only proceed if you understand the risks.
 
 **Prerequisites:**
-- Car with PCM5/MH2P
+- Car with PCM5/MH2P (Porsche tested; Audi MH2p experimental, see [Audi MH2p](#audi-mh2p-e-tron-and-other-mlbevo-audis--experimental))
 - SD card
 - Android Auto phone
 - Android Auto <a href="https://lawpaul.github.io/MH2p_SD_ModKit_Site/">activated </a>
@@ -161,6 +161,121 @@ recompile.bat
 
 **Deploy and test:**
 The easiest way is to just scp it to the target if you <a href="https://github.com/fifthBro/mh2p-ssh-access">enbaled ssh access</a>
+
+---
+
+## Audi MH2p (e-tron and other MLBevo Audis) — experimental
+
+> **Status:** untested on real hardware. The port changes the install gate and packaging only: the native binaries and the config are byte-identical to the Porsche release, and the Java classes are the release classes unchanged (on Audi the installer uses a copy of the JAR with the CarPlay classes left out). Expect to iterate with logs before the cluster shows anything.
+
+### Why it might just work
+
+The Porsche PCM5 HMI is built on Audi's framework: every platform class this mod touches lives in `de.audi.*` packages (`CombiBAPServiceNavi` for the cluster's BAP navigation protocol, `ISysServices`, `ICarCoreServices`, the navigation bundle's `IMapClusterService` whose methods talk about the "Kombi", Audi's word for the instrument cluster), and Android Auto runs in the same `gal` process. Nothing in the Java layer or the native hooks checks for Porsche; only the ModKit install script did. The turn-by-turn path (arrows, distance, road name over BAP) has the best odds, because it only uses those shared services. The cluster video path additionally assumes the head unit drives the cluster as QNX displayable `33`. That is known for Porsche and looks right for MH2p Audis: Audi's own service training for the MIB2+ A8 (eSelf-Study Program 990293) states that the virtual cockpit "receives image data from J794 [the MMI main unit] via LVDS and MOST bus", with LVDS carrying "the large navigation map and the detailed intersection maps", which is the same head-unit-rendered cluster map architecture the mod relies on. A public, research-only analysis of an Audi Q3 F3 image with the same `MH2p_ER_AUG35_P2873` firmware (github.com/Dezoxy/audi-mh2p-p2873-research, report 02) found `DISPLAYABLE_KOMBI_MAP_VIEW = 33` in that HMI's display-management constants, the same `switchKombiMapToHiddenContext()` map-control methods, a cluster display on `LVDS2`, and all 61 symbols `gal_cluster.c` imports resolving against that image's receiver, protobuf and screen libraries; it states that nothing in it has run on a vehicle, and it does not compare object layouts or Java constructors with Porsche. Upstream has not answered the two Audi requests on its tracker (issue #8, an A6/A7 on P2711, closed without comment; issue #16 open), so treat every step below as the first public attempt.
+
+Prerequisites specific to Audi: the head unit must be MH2p (MMI version string `MH2P_..`; MY2021+ e-trons are MIB3 with 3xxx firmware and out of scope), and Android Auto must already work. LawPaul's ModKit page lists the e-tron as supported with "extra steps for Apple CarPlay or Android Auto"; those steps are not public, so get Android Auto activated first and only then install this mod.
+
+Two different things have to line up in the `gal` hook, and they carry different risk. The C++ symbol names it interposes come from Google's receiver library (`libautoreceiver.so`) and have stayed stable across VW-group generations; the installer now checks them on your unit and a missing one only makes that hook a silent pass-through. The object layouts it pokes (the message router's endpoint table, the `shared_ptr<IoBuffer>` it reads on every incoming message) were taken from the Porsche binary and can only be tested on the car; a mismatch there can crash `gal`, which is why the diagnostic first boot below exists.
+
+### What the Audi package changes
+
+- `install.sh` accepts `OEM=AU` in addition to `PO`. Firmware build numbers are one VAG-wide counter, so the Audi range is 26xx / 27xx / 28xx: public e-tron GE strings are `MH2p_ER_AUG35_P2711`, `P2718`, `K2716_1` and `P2873` (EU) and `MH2P_US_AUG35_P2711` (US); the firmware trains listed on mib-helper.com for AUG35 are K2470, P2711, P2718, K2716, P2873 and P9805. An e-tron still on the 2019 launch build `K2470` is outside the accepted range; update the MMI first, or use `force_install.txt` knowingly. `P2873` sits in the same build window as the Porsche `P2870` / `P2874` the hooks were built against and is the best-case target; the 27xx builds are older and untested, so the installer prints a warning for any Audi build outside 28xx. Units without a TYPE code (`MH2p_ER_AU_P2873`, Q3 and A1) parse fine.
+- Other OEMs and out-of-range firmware still abort. `Mods/ClusterIntegration/force_install.txt` on the SD card overrides the OEM and firmware gate for people who know what they are doing.
+- A preflight check aborts before changing anything if `/mnt/app/eso/hmi/lsd/jars` or `/mnt/app/eso/bin/apps` is missing.
+- Every change is recorded in `Mods/ClusterIntegration/Update/Backup/manifest.txt` with the backup copy it made (see [Backups and rollback](#backups-and-rollback)).
+- On Audi, CarPlay support is opt-in via `Mods/ClusterIntegration/enable_carplay.txt`. Without it the installer uses `Update/aa_only/*_aa.jar`, a copy of the release JAR without the `carplay` package (and without the pure-stock `AndroidAuto2EventListener` copy), so the only stock class shadowed is `AndroidAuto2Subsystem` and Audi's own `CarPlayDSIManager` keeps running CarPlay; the `dio_manager` wrapper and hook are not installed either. The CarPlay hook rewrites every iAP2 Identify inside the wireless CarPlay process using Porsche-derived object layouts, and the CarPlay shadow class replaces Audi's whole CarPlay DSI manager; on an untested unit either can break CarPlay outright, and neither does anything for Android Auto. Porsche installs everything as before.
+- The installer refuses to run on Audi if no stock HMI jar contains `de.audi.app.car.adi.legacy.sportchrono.StorageMountHandler`, a Porsche-side class the mod's Java code constructs (`force_install.txt` overrides).
+- Per-car settings can be baked into the installed config from the card: `Mods/ClusterIntegration/config_overrides.txt` holds `key=value` lines (JSON values) that the installer applies to the top-level `config` block of `cluster_config.json` and records in the manifest; `config_overrides.example.txt` ships next to it with the useful keys commented out. Re-running without the file reinstalls the shipped config.
+- Marker files next to `Update/` on the card: `force_install.txt` (skip the gate), `diag.txt` (diagnostic mode), `enable_carplay.txt` (CarPlay hook and full JAR on Audi), `config_overrides.txt` (config values), `uninstall.txt` (ModKit convention: run the uninstaller).
+- `uninstall.sh` no longer checks the OEM. It only restores what the mod changed, so it is safe everywhere. `Update/rollback.sh` runs it over SSH without the ModKit.
+
+The scripts are tracked under `modkit/`, and `modkit/build_sd_package.sh` rebuilds a flashable zip from any release zip (deriving the Android-Auto-only JAR as it goes); `modkit/check_hmi_signatures.sh` compares the shadowed classes against a unit's stock jars with `javap`:
+
+```
+modkit/build_sd_package.sh builds/ClusterIntegration_v0034_beta2_candidate_90d0b76.zip \
+                           builds/ClusterIntegration_v0034_beta2_candidate_90d0b76_audi.zip
+```
+
+### Install on an Audi
+
+Do it in two passes. The first pass installs everything in diagnostic mode: the JAR runs turn-by-turn only (`enableMapRender` is set to `false` in the installed config), the Android Auto hook loads and logs but does not inject the cluster service, and Android Auto otherwise behaves as stock. That pass answers the three questions that matter (does the shadowed Java class load on Audi firmware, do the arrows reach the virtual cockpit over BAP, does the hook resolve its symbols) with the smallest possible blast radius. It does not remove every risk: the hook's `routeMessage` interposer reads the receiver's `shared_ptr<IoBuffer>` layout on every incoming message regardless of the diagnostic switch, so a layout mismatch can still crash `gal` in this pass (that is what the rollback paths are for). The second pass goes live with the video path.
+
+1. Extract `builds/ClusterIntegration_v0034_beta2_candidate_90d0b76_audi.zip` to a FAT32 SD card and create an empty file `Mods/ClusterIntegration/diag.txt`. For a right-hand-drive car, copy `Mods/ClusterIntegration/config_overrides.example.txt` to `config_overrides.txt` in the same folder and uncomment `forceRHD=true` (it fixes the roundabout arrow correction and Waze keep-lane side regardless of what the car reports). Android Auto must already be activated on the unit.
+2. Follow the normal Installation steps above. After the reboot, pull the card and read `Logs/ClusterIntegration.log`:
+   - `Head unit: release=MH2p_ER_AUG35_P2873 oem=AU type=G35 region=ER sw=2873 force=0` (your values will differ). `Aborting` means the gate refused, `ERROR` means the preflight or a backup check refused.
+   - every `install:` line names a file that was written; `Backups:` names the folder holding the originals; `diag mode: ON` confirms the staged mode.
+   - `hmi class check: StorageMountHandler found in: ...` means the Audi HMI ships the Porsche-side class the mod's Java code links against. If it is `NOT found`, the installer aborts on Audi before changing anything, because the shadowed `AndroidAuto2Subsystem` would die with `NoClassDefFoundError` and take Android Auto with it; `force_install.txt` overrides that if you want to try regardless (rollback works).
+   - `hook symbols: 14/14 present in ...` means the Android Auto receiver on your unit exports everything the hook interposes. Fewer means the missing hooks will silently do nothing; `check skipped` means the library was not found or `grep -a` is unavailable.
+3. Put the card back in, connect the phone, start navigation in Google Maps or Waze and drive a little. In this pass the virtual cockpit should already show Android Auto's turn arrows and distances through BAP (no map video yet). Then read the logs: `cluster.log` on the card must contain `SYS: Android Auto Cluster Integration Initialized`, `SYS: CombiBAPServiceNavi service AVAILABLE` and `DSI_IN:` lines; `/tmp/gal_preload.log` (SSH) must contain `gal diag mode:` and `gal preload: /mnt/app/eso/bin/apps/cluster/gal_cluster.so`; `/tmp/gal_cluster.log` must contain a `symbols: populate_sd=... sd_serialize=...` line with non-zero addresses and no crash. If Android Auto itself no longer starts, run `rollback.sh` (a `gal_exit:` with a non-zero code right after the preload line means the runtime linker refused the hook; no `SYS:` lines at all means the shadowed Java class did not load).
+4. Optional but recommended before going live: the diagnostic install also copied the stock HMI jars that contain the shadowed classes to `Mods/ClusterIntegration/Update/Backup/hmi_reference/` on the card. On a PC with a JDK, run `modkit/check_hmi_signatures.sh Mods/ClusterIntegration/Update/ClusterIntegration_v0034_beta2_candidate_90d0b76.jar <that folder>` (the full JAR, so every shadowed class is compared); `MATCH` on `AndroidAuto2Subsystem` means the Audi firmware constructs the class exactly the way the mod's copy expects, `MISMATCH` shows the differing constructor and means the mod JAR will not load on this firmware without a rebuild.
+5. Go live: delete `Mods/ClusterIntegration/diag.txt` from the card and run the installation again. It is idempotent: it removes the marker and puts the shipped `cluster_config.json` (video path enabled) back. Reconnect the phone and start navigation.
+
+To get back into diagnostic mode later, put `diag.txt` back and run the installer again; it is the only way that also switches the installed config to turn-by-turn only.
+
+### First-boot checklist
+
+Logs are written to the SD card when `enableExternalLogging` is `true` (the default). With SSH access the same files are under `/tmp`.
+
+| Log | Where | What to look for |
+|---|---|---|
+| `cluster.log` | SD root, or `/tmp/cluster.log` | `SYS: CombiBAPServiceNavi ...` lines at boot prove the JAR loaded on Audi firmware. `CAR_VARIANT: no entry for X_Y` gives your car's `carClass_generation` key. `DSI_IN:` lines prove Android Auto events reach the bridge. |
+| `cluster_daemon.log` | SD root, or `/tmp/cluster_daemon.log` | `detect_disp: disp[n] id=.. size=..` lists every display the head unit drives. `display size: WxH (... auto=ok ...)` proves displayable 33 exists and reports the cluster video resolution; `auto=fail` means it was not found. `[daemon] start:` / `prepare` lines show the Java side driving the mirror. `NvMedia loaded OK` and `BeginSequence:` prove the H.264 decode path works. |
+| `gal_preload.log` | `/tmp` (SSH only) | `gal preload: /mnt/app/eso/bin/apps/cluster/gal_cluster.so` proves the wrapper injected the hook into the Android Auto process (`error preload:` means the file was missing); `gal diag mode:` shows the staged mode is active. |
+| `gal_cluster.log` | `/tmp` (SSH only; written in diagnostic mode, or with `GAL_CLUSTER_LOG=1` exported in the `gal` wrapper — the shipped v0034 hook reads `GAL_CLUSTER_LOG`, the repo source reads `GAL_CLUSTER_LOG_ALL`) | `symbols: populate_sd=... sd_serialize=...` with non-zero addresses proves the interposed symbols resolved. In live mode `cluster service built`, `sdresp: HYBRID` and `fake endpoint installed` prove the phone was offered the cluster display, and `cluster endpoint: onChannelOpened ch=14` proves it accepted it (the `svc_id=` printed by `handleChannelOpenReq` is layout-derived and may be wrong on Audi). Leave `GAL_CLUSTER_DECODE` unset: the in-hook decoder uses Porsche-only offsets; decoding happens in the `cluster` daemon. |
+
+If the turn-by-turn arrows work but the map video does not, the BAP path is fine and the problem is the video path (`gal_cluster.so`, `cluster` daemon, or displayable 33). If Android Auto itself stops working after install, the shadowed `AndroidAuto2Subsystem` class does not match the Audi firmware; uninstall as described below.
+
+### Tuning for your car
+
+Per-car values live in `cluster_config.json`. A copy at the SD card root (`/fs/sda0/cluster_config.json`) overrides the installed one for every reader while the card is inserted, which is handy for trying zoom and pan values without reflashing. It also silently overrides everything the installer wrote, including `config_overrides.txt` values and diagnostic mode's turn-by-turn-only setting, so use one mechanism or the other (the installer warns if it finds a root copy) and remove the root file when you are done. Take the key from the `CAR_VARIANT` log line and add an entry next to the Porsche ones (v0034 schema shown; older builds used a flat `mirrorCarConfig` block):
+
+```json
+"carConfig": {
+  "X_Y": {
+    "name": "e-tron GE", "bargraphMode": "always", "aaClusterMode": "h264",
+    "mirror":   { "mode": "fill",   "zoomX": 1.0, "zoomY": 1.0, "panX": 0.0, "panY": 0.0 },
+    "gal_h264": { "codecRes": 720,  "mode": "letter", "zoomX": 1.0, "zoomY": 1.0, "panX": 0.0, "panY": 0.0 }
+  }
+}
+```
+
+For a right-hand-drive car, set `forceRHD=true` through `config_overrides.txt` (or `"forceRHD": true` in the `config` block): drive side is otherwise read from the car's climate-control master position, with the country table as fallback, and it decides the roundabout angle correction and the Waze keep-lane side. Units follow the car's own km/mi setting; `imperialSmallUnit="yards"` only matters if the country lookup fails (GB already maps to yards). Without a car entry the global `config.mirror` and `config.gal_h264` values apply, which is a reasonable first try. The e-tron panel is 1920x720, but the size of the map window the MMI streams to it is unknown, so expect to adjust `gal_h264.mode` / zoom / pan. Note that the native `gal_cluster.so` picks its own per-car settings by Porsche part-number prefix (it queries the head unit's part number and knows 9Y1/9YA/992/971/95B), so on an Audi it uses its global or compiled defaults regardless of the `carConfig` key; the Java side still honours your entry. Fit and framing are tuned with `gal_h264.mode`, `zoomX`/`zoomY`, `panX`/`panY` and `codecRes` (720 or 480); `cluster capture=test verbose=1 zoomX=.. panX=..` over SSH draws a calibration pattern with the same numbers.
+
+If the daemon logs `auto=fail`, the QNX display whose integer id is `33` was not found. On the Audi image analysed above the cluster is listed as display 4 on `LVDS2`, so this may well happen, and it is not by itself fatal: the daemon's H.264 window is bound by name to displayable `33` (the id the Audi HMI itself uses for the cluster map) and sized to the video stream, and the auto-detected size only affects the test pattern and splash images. Try navigation with the phone before concluding. Only if the window reports `got_visible=1` yet nothing appears on the cluster is the named binding wrong too, and that needs a rebuild of `src/cluster.c` with a configurable displayable (`xres=`/`yres=` cannot fix it: they only size the test pattern and the blit rectangle inside the video-sized window, and values larger than the stream break the blit). `cluster capture=display verbose=1` lists every display with its id and size (Ctrl-C to stop).
+
+### CarPlay on Audi
+
+Turn-by-turn from CarPlay needs the `dio_manager` hook, which is opt-in on Audi (`enable_carplay.txt`). Before enabling it, run a diagnostic-mode pass with it enabled: the wrapper exports `DIO_CLUSTER_LOG=1`, and the shipped hook writes `dio_cluster.log` to the SD card root with `IDENTIFY orig` / `IDENTIFY new` dumps and the phone's `ACCEPTED` / `REJECTED` answer. A rejected Identify on every connection means the Audi head unit already advertises route guidance or the layout differs; disable the hook by deleting `enable_carplay.txt` and running the installer again (it puts the stock `dio_manager` back) rather than leaving CarPlay broken. `uninstall.txt` removes the whole mod instead. The hook also only triggers on wireless CarPlay sessions hosted by `dio_manager` that stream location to the phone; wired sessions live in another process and never reach it.
+
+### Known unknowns
+
+- Whether the Audi firmware's `AndroidAuto2Subsystem` (18-argument constructor) and `CarPlayDSIManager` constructors match the shadowed classes in the JAR. A mismatch raises a linkage error in the caller that nothing catches, and Android Auto or CarPlay stay dead until the JAR is removed. The installer can only check the `StorageMountHandler` class dependency, not constructor signatures; with SSH you can compare them yourself by pulling the stock terminalmode jar from `/mnt/app/eso/hmi/lsd/jars` and running `javap -p` on it.
+- Whether the Audi build of `gal` / `libautoreceiver.so` lays out `MessageRouter` and `shared_ptr<IoBuffer>` the way the Porsche one does (the installer's symbol check covers names, not layouts). A layout mismatch can crash `gal` and take Android Auto down until rollback; missing symbols only leave the cluster blank.
+- Whether service ids 14 and 21, which the hook adds to the phone's service discovery, are unused in the Audi receiver's own list. A clash makes the phone reject the session (`gal` restarts in a loop). The diagnostic first boot with `GAL_CLUSTER_SD_LOG=1` dumps the stock list as `/tmp/aa_sdresp_*.bin` for checking.
+- Whether the Audi cluster video link is displayable `33` and what resolution it has.
+- Which Audi firmware versions carry the Android Auto receiver this hook was built against. `P2873` is the closest match to the Porsche builds; the 27xx e-tron builds are accepted by the gate but unverified.
+- What LawPaul's e-tron "extra steps" for Android Auto are, and whether they change anything this mod relies on.
+- The `carClass`/`generation` values for the e-tron (read them from the log and please report them back).
+- The shipped `cluster`, `gal_cluster.so` and JAR in `builds/` are newer than the sources in `src/` and `lsd/` (extra log lines, the `carConfig` schema, config reading in the hook). A rebuild from this repository would regress them, so the Audi port deliberately reuses the release binaries unchanged.
+
+### Backups and rollback
+
+The installer never overwrites a file without first copying it to `Mods/ClusterIntegration/Update/Backup/` on the SD card and verifying the copy (size and checksum); if the backup cannot be verified, that file is skipped. What ends up where:
+
+| Original | Kept on the head unit as | Copy on the SD card |
+|---|---|---|
+| `/mnt/app/eso/bin/apps/gal` | `gal.real` (the wrapper execs it) | `Backup/gal.real` and `Backup/gal.original.<timestamp>` |
+| `/mnt/app/eso/bin/apps/dio_manager` | `dio_manager.real` | `Backup/dio_manager.real` and `Backup/dio_manager.original.<timestamp>` |
+| an older `ClusterIntegration_*.jar` or cluster file being replaced | removed | `Backup/<name>.backup.<timestamp>` |
+
+Everything else the mod installs (the JAR, `cluster`, the two `.so` files, `cluster_config.json`) is new on a stock unit and is listed as `add` in `Backup/manifest.txt`; rollback deletes it. The manifest has one line per action (`add`, `replace`, `swap`, `remove`, `restore`) with the backup path, appended on every run.
+
+To roll back:
+
+- **With the ModKit:** put an empty `uninstall.txt` in `Mods/ClusterIntegration/` on the SD card and boot with it inserted. `uninstall.sh` restores `gal` and `dio_manager` from their `.real` originals (falling back to `Backup/*.real` on the card if `.real` is missing), removes the added files (backing each one up as `*.removed.<timestamp>`), and records what it did in the manifest.
+- **Over SSH:** `ksh /fs/sda0/Mods/ClusterIntegration/Update/rollback.sh` does the same without a reboot cycle (the card may be on `/fs/sdb0` or `/fs/usb0_0` on your unit).
+- **Boot loop or dead Android Auto:** the ModKit runs a `failsafe.sh` from the root of the SD card early in every boot. A ready-made one ships as `Mods/ClusterIntegration/failsafe.sh` (inert there); copy it to the card's root, boot once with the card in, then delete it from the root again or it rolls back on every boot. Output goes to `Logs/ClusterIntegration-failsafe.log`.
+
+Keep the SD card: it is the only place the timestamped history lives. A factory firmware update rewrites `/mnt/app` and removes the mod along with the `.real` files anyway.
 
 ---
 

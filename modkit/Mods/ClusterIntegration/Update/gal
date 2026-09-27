@@ -1,0 +1,57 @@
+#!/bin/ksh
+#
+# Copyright (c) 2026 fifthBro
+# https://fifthbro.github.io
+#
+# Licensed under CC BY-NC-SA 4.0
+# https://creativecommons.org/licenses/by-nc-sa/4.0/
+# NOT FOR COMMERCIAL USE
+#
+# Wrapper for `gal` that sets LD_PRELOAD=gal_cluster.so before execing the
+# real gal binary. Installed by install.sh; the original is preserved at
+# /mnt/app/eso/bin/apps/gal.real. uninstall.sh restores the original.
+
+GAL_PRELOAD="/mnt/app/eso/bin/apps/cluster/gal_cluster.so"
+GAL_PRELOAD_LOG="/tmp/gal_preload.log"
+
+echo -e "\ngal_date: $(date)"  >> $GAL_PRELOAD_LOG
+
+if [ -f $GAL_PRELOAD ]; then
+    export LD_PRELOAD=$GAL_PRELOAD
+    echo "gal preload: $GAL_PRELOAD" >> $GAL_PRELOAD_LOG
+else
+    echo "error preload: $GAL_PRELOAD not found" >> $GAL_PRELOAD_LOG
+fi
+
+# Diagnostic mode: marker left by install.sh when Mods/ClusterIntegration/
+# diag.txt is on the SD card (install.sh also sets enableMapRender=false in
+# the installed config so the Java side does not post an empty cluster
+# window). The hook then loads, resolves its symbols and logs the stock
+# service discovery, but does not inject the cluster service
+# (GAL_CLUSTER_MERGE=0).
+# GAL_CLUSTER_LOG is what the shipped v0034 hook reads; GAL_CLUSTER_LOG_ALL is
+# the name used by the repo source, exported too so either build logs.
+for diag in /mnt/app/eso/bin/apps/cluster/diag_mode; do
+    if [ -f "$diag" ]; then
+        export GAL_CLUSTER_MERGE=0
+        export GAL_CLUSTER_LOG=1
+        export GAL_CLUSTER_LOG_ALL=1
+        export GAL_CLUSTER_LOG_DETAILS=1
+        export GAL_CLUSTER_SD_LOG=1
+        echo "gal diag mode: $diag (MERGE=0, logging to /tmp/gal_cluster.log)" >> $GAL_PRELOAD_LOG
+        break
+    fi
+done
+
+echo "gal_start: $* LD_PRELOAD: $LD_PRELOAD LD_LIBRARY_PATH:$LD_LIBRARY_PATH" >> $GAL_PRELOAD_LOG
+
+if [ ! -x /mnt/app/eso/bin/apps/gal.real ]; then
+    echo "error: /mnt/app/eso/bin/apps/gal.real missing, cannot start gal (restore it from Backup/gal.real on the SD card)" >> $GAL_PRELOAD_LOG
+    exit 127
+fi
+
+/mnt/app/eso/bin/apps/gal.real "$@"
+rc=$?
+echo "gal_exit: $rc" >> $GAL_PRELOAD_LOG
+exit $rc
+

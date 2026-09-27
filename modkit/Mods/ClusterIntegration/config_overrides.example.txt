@@ -1,0 +1,26 @@
+# Per-car settings baked into the installed cluster_config.json by install.sh.
+#
+# Copy this file to  Mods/ClusterIntegration/config_overrides.txt  (same
+# folder) and uncomment what you need. One  key=value  per line; the value is
+# written exactly as JSON (true / false / a number / "a string"). Keys are
+# looked up in the top-level "config" block of cluster_config.json; nested
+# objects (mirror, gal_h264) and carConfig entries are not touched. Re-running
+# the installer without config_overrides.txt reinstalls the shipped config.
+#
+# Right-hand-drive car (UK, Ireland, Japan, Australia, ...): forces the
+# roundabout angle correction and Waze keep-lane side without relying on the
+# car's driver-side property or the country table.
+#forceRHD=true
+#
+# Show yards below 0.1 mi instead of feet when the car is set to miles
+# (only matters while imperialSmallUnit is "auto" and the country lookup fails).
+#imperialSmallUnit="yards"
+#
+# Always use miles/yards regardless of the car's unit setting.
+#forceImperial=true
+#
+# Turn-by-turn only (no cluster map video), the same as diagnostic mode does.
+#enableMapRender=false
+#
+# Text only instead of text + bargraph if the virtual cockpit draws both badly.
+#bargraphMode="distance"
