@@ -24,6 +24,15 @@ else
     echo "error preload: $DIO_PRELOAD not found" >> $DIO_PRELOAD_LOG
 fi
 
+# Diagnostic mode (see the gal wrapper): enable the CarPlay hook's log.
+for diag in /mnt/app/eso/bin/apps/cluster/diag_mode /fs/sda0/cluster_diag.txt /fs/sdb0/cluster_diag.txt /fs/usb0_0/cluster_diag.txt; do
+    if [ -f "$diag" ]; then
+        export DIO_CLUSTER_LOG=1
+        echo "dio diag mode: $diag (logging to /tmp/dio_cluster.log)" >> $DIO_PRELOAD_LOG
+        break
+    fi
+done
+
 echo "dio_start: $* LD_PRELOAD: $LD_PRELOAD LD_LIBRARY_PATH:$LD_LIBRARY_PATH" >> $DIO_PRELOAD_LOG
 
 if [ ! -x /mnt/app/eso/bin/apps/dio_manager.real ]; then

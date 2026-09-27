@@ -13,6 +13,11 @@
 # - Supported head units: Porsche PCM5 (OEM=PO, firmware 26xx/28xx, tested)
 #   and Audi MH2p (OEM=AU, experimental). Other OEMs abort unless
 #   Mods/ClusterIntegration/force_install.txt exists on the SD card.
+# - Marker files next to the Update/ folder on the SD card:
+#     force_install.txt   skip the OEM / firmware gate
+#     diag.txt            hook logs only, no cluster service injected
+#     enable_carplay.txt  install the CarPlay (dio_manager) hook on Audi
+#     uninstall.txt       ModKit convention: run uninstall.sh instead
 # - Copies JAR, cluster, gal_cluster.so, dio_cluster.so to their target dirs.
 # - Skips copies when the target file is byte-identical to the source.
 # - Backs up any existing target before overwriting (timestamped, into
@@ -271,11 +276,99 @@ chmod 755 "$CLUSTER_DIR/dio_cluster.so" 2>/dev/null
 chmod 644 "$CLUSTER_DIR/cluster_config.json" 2>/dev/null
 
 swap_binary_for_wrapper gal
-swap_binary_for_wrapper dio_manager
+
+# CarPlay hook (dio_manager wrapper + dio_cluster.so). On Porsche it is always
+# installed. On Audi it is opt-in via Mods/ClusterIntegration/enable_carplay.txt:
+# the hook patches every iAP2 Identify inside the wireless-CarPlay process with
+# Porsche-derived object layouts, so on an untested unit it is risk without
+# benefit for an Android Auto user. Without the marker any earlier wrapper is
+# restored so the unit runs the stock dio_manager.
+if [[ "$OEM" != "AU" || -e "$MOD_ROOT/enable_carplay.txt" ]]; then
+    swap_binary_for_wrapper dio_manager
+    print "carplay hook:      ON"
+else
+    if [[ -f "$APPS_DIR/dio_manager.real" ]]; then
+        bk="$BACKUP_DIR/dio_manager.wrapper.removed.$(ts)"
+        cp -p "$APPS_DIR/dio_manager" "$bk" 2>/dev/null
+        mv "$APPS_DIR/dio_manager.real" "$APPS_DIR/dio_manager" && \
+            print "restore original:  $APPS_DIR/dio_manager.real -> $APPS_DIR/dio_manager (carplay hook disabled)" && \
+            note "restore $APPS_DIR/dio_manager from=$APPS_DIR/dio_manager.real"
+    fi
+    print "carplay hook:      OFF (Audi default; create Mods/ClusterIntegration/enable_carplay.txt to install it)"
+fi
+
+# Diagnostic mode. If Mods/ClusterIntegration/diag.txt exists on the SD card,
+# leave a marker that makes the gal wrapper start the hook with
+# GAL_CLUSTER_MERGE=0 (no cluster service injected into the phone's service
+# discovery, no endpoint table write) plus full logging, and the dio_manager
+# wrapper with DIO_CLUSTER_LOG=1. Android Auto then behaves as stock while
+# /tmp/gal_cluster.log shows whether the hook loaded, which symbols resolved
+# and what the stock service discovery looks like. Re-run without diag.txt
+# (or delete the marker over SSH) to go live.
+DIAG_MARKER="$CLUSTER_DIR/diag_mode"
+if [[ -e "$MOD_ROOT/diag.txt" ]]; then
+    if [[ ! -f "$DIAG_MARKER" ]]; then
+        : > "$DIAG_MARKER" && chmod 644 "$DIAG_MARKER" && note "add $DIAG_MARKER"
+    fi
+    print "diag mode:         ON  ($DIAG_MARKER) - hook logs only, cluster service NOT injected"
+else
+    if [[ -f "$DIAG_MARKER" ]]; then
+        rm -f "$DIAG_MARKER" && note "remove $DIAG_MARKER"
+        print "diag mode:         OFF (marker removed)"
+    else
+        print "diag mode:         OFF"
+    fi
+fi
+
+# Informational: does this unit's Android Auto receiver export the symbols
+# gal_cluster.so interposes? A missing symbol means that hook is a silent
+# pass-through (cluster stays blank), never a crash. Object layouts cannot
+# be checked here. Output goes to the ModKit log for the first-boot review.
+check_hook_symbols() {
+    typeset lib sym c present missing
+    lib="$(find /mnt/app -name 'libautoreceiver*' 2>/dev/null | head -1)"
+    if [[ -z "$lib" ]]; then
+        print "hook symbols:      libautoreceiver not found under /mnt/app (check skipped)"
+        return 0
+    fi
+    present=0; missing=""
+    for sym in \
+        _ZN13MessageRouter32populateServiceDiscoveryResponseEP24ServiceDiscoveryResponse \
+        _ZN13MessageRouter13queueOutgoingEhPvj \
+        _ZN13MessageRouter19sendChannelOpenRespEhi \
+        _ZN13MessageRouter20handleChannelOpenReqEhRK18ChannelOpenRequest \
+        _ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE \
+        _ZN10Controller12routeMessageEhtRK10shared_ptrI8IoBufferE \
+        _ZN13MediaSinkBase12routeMessageEhtRK10shared_ptrI8IoBufferE \
+        _ZN24NavigationStatusEndpoint16addDiscoveryInfoEP24ServiceDiscoveryResponse \
+        _ZN24NavigationStatusEndpoint22handleNavigationStatusERK16NavigationStatus \
+        _ZN24NavigationStatusEndpoint29handleNavigationDistanceEventERK31NavigationNextTurnDistanceEvent \
+        _ZN24NavigationStatusEndpoint29handleNavigationNextTurnEventERK23NavigationNextTurnEvent \
+        _ZN24NavigationStatusEndpoint4stopEv \
+        _ZN24NavigationStatusEndpoint5startEv \
+        _ZN27NavFocusRequestNotification27MergePartialFromCodedStreamEPN6google8protobuf2io16CodedInputStreamE \
+    ; do
+        c="$(grep -a -c -- "$sym" "$lib" 2>/dev/null)"
+        if [[ $? -gt 1 ]]; then
+            print "hook symbols:      grep -a unavailable on this unit (check skipped)"
+            return 0
+        fi
+        if [[ "$c" != "0" && -n "$c" ]]; then
+            present=$((present + 1))
+        else
+            missing="$missing $sym"
+        fi
+    done
+    print "hook symbols:      $present/14 present in $lib"
+    [[ -n "$missing" ]] && print "hook symbols:      missing:$missing"
+    return 0
+}
+check_hook_symbols
 
 sync
 print ""
 print "Backups:           $BACKUP_DIR (manifest.txt lists every change)"
+print "Diagnostics:       put diag.txt in Mods/ClusterIntegration/ and re-run to log without injecting (see README)"
 print "Rollback:          put uninstall.txt in Mods/ClusterIntegration/ and re-run the ModKit,"
 print "                   or over SSH: ksh $MOD_PATH/rollback.sh"
 print "Done."

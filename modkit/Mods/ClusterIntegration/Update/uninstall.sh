@@ -124,6 +124,7 @@ backup_and_remove "$CLUSTER_DIR/cluster"
 backup_and_remove "$CLUSTER_DIR/gal_cluster.so"
 backup_and_remove "$CLUSTER_DIR/dio_cluster.so"
 backup_and_remove "$CLUSTER_DIR/cluster_config.json"
+[[ -f "$CLUSTER_DIR/diag_mode" ]] && rm -f "$CLUSTER_DIR/diag_mode" && print "remove:            $CLUSTER_DIR/diag_mode" && note "remove $CLUSTER_DIR/diag_mode"
 
 typeset j
 for j in "$JAR_DIR"/ClusterIntegration_* "$JAR_DIR"/AndroidAutoCluster_*; do
