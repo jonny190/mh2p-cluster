@@ -30,15 +30,22 @@
 #   The original binary is preserved at /mnt/app/eso/bin/apps/gal.real so
 #   uninstall.sh can restore it.
 # - Same for dio_manager.
-# - Writes Backup/manifest.txt (add / replace / swap / remove lines with the
-#   backup path for each) so every change can be rolled back; uninstall.sh
-#   or rollback.sh performs the rollback.
+# - Writes Backup/manifest.txt (add / replace / swap / remove / override
+#   lines with the backup path for each) as the record of what was changed.
+#   uninstall.sh / rollback.sh restore the swapped binaries and remove the
+#   mod's own files (its fixed list plus any "add" entries in the manifest
+#   under the mod's own directories).
 #
 
 set -u
 
 export MOD_PATH="${modPath:-${MOD_PATH:-}}"
 [[ -z "$MOD_PATH" ]] && { print -u2 "ERROR: MOD_PATH not set"; exit 1; }
+
+# grep -a (treat binaries as text) is used to scan jars and libraries; probe
+# once and fall back to plain grep (exit status still reflects a match).
+GREP_A="-a"
+print x | grep -a -q x 2>/dev/null || GREP_A=""
 
 [[ ! -e /mnt/app ]] && mount -t qnx6 /dev/mnanda0t177.1 /mnt/app
 mount -uw /mnt/app/
@@ -97,6 +104,9 @@ case "$OEM" in
         fi
         if [[ "$OEM" == "AU" ]]; then
             print "Audi support is EXPERIMENTAL: the JAR and native hooks were built against Porsche PCM5."
+            if [[ "$SOFTWARE_VERSION" != 28?? ]]; then
+                print "WARNING: Audi build $SOFTWARE_VERSION is outside the 28xx window the hooks were built against (P2873 is the closest known match). Run the diagnostic pass first."
+            fi
             print "If Android Auto or CarPlay stop working: put uninstall.txt in Mods/ClusterIntegration/ and re-run the ModKit."
         fi
         ;;
@@ -130,18 +140,48 @@ if [[ ! -f "$APPS_DIR/gal" && ! -f "$APPS_DIR/gal.real" ]]; then
     print "WARN: $APPS_DIR/gal not found. Android Auto cluster video hook cannot be installed on this unit; BAP turn-by-turn (JAR) will still be installed."
 fi
 
+# CarPlay is opt-in on Audi (enable_carplay.txt). Without it the Android-
+# Auto-only JAR from aa_only/ is required; refuse to fall back to the full
+# JAR, which would shadow Audi's CarPlay DSI manager.
+CARPLAY_HOOK=1
+[[ "$OEM" == "AU" && ! -e "$MOD_ROOT/enable_carplay.txt" ]] && CARPLAY_HOOK=0
+if [[ $CARPLAY_HOOK -eq 0 ]]; then
+    AA_JAR="$(ls -1t "$MOD_PATH"/aa_only/ClusterIntegration_*_aa.jar 2>/dev/null | head -1)"
+    if [[ -z "$AA_JAR" || ! -f "$AA_JAR" ]]; then
+        print -u2 "ERROR: $MOD_PATH/aa_only/ClusterIntegration_*_aa.jar not found. Use the _audi package built by modkit/build_sd_package.sh, or create enable_carplay.txt to install the full JAR. Aborting before any change."
+        exit 4
+    fi
+fi
+
+# A cluster_config.json at the root of an inserted card or stick takes
+# precedence over the installed copy for every reader (JAR, cluster daemon,
+# gal hook). Warn, because config_overrides.txt and diag mode only touch the
+# installed copy and would be ignored while that file is present.
+typeset rootcfg
+for rootcfg in /fs/usb0_0 /fs/usb1_0 /fs/sda0 /fs/sdb0; do
+    if [[ -f "$rootcfg/cluster_config.json" ]]; then
+        print "WARN: $rootcfg/cluster_config.json exists and overrides the installed config while inserted; config_overrides.txt and diag mode have no effect until it is removed."
+    fi
+done
+
+# Print every stock HMI jar (excluding ours) whose directory lists the given
+# class path. Jar directories are stored uncompressed, so grep finds it.
+jars_containing() {
+    typeset j
+    find "$JAR_DIR" -name '*.jar' 2>/dev/null | grep -v '/ClusterIntegration_' | grep -v '/AndroidAutoCluster_' | while read j; do
+        if grep $GREP_A -q -- "$1" "$j" 2>/dev/null; then print -r -- "$j"; fi
+    done
+}
+
 # The mod's Java classes shadow the stock AndroidAuto2Subsystem and construct
 # de.audi.app.car.adi.legacy.sportchrono.StorageMountHandler ("Sport Chrono"
 # is a Porsche feature). If no HMI jar on this unit contains that class the
 # shadowed subsystem dies with NoClassDefFoundError and Android Auto stops
-# working. Jar directories are stored uncompressed, so grep -a finds the
-# class path. Porsche: informational. Audi: abort unless forced.
+# working. Porsche: informational. Audi: abort unless forced.
 check_hmi_class() {
     typeset cls hits
     cls="de/audi/app/car/adi/legacy/sportchrono/StorageMountHandler.class"
-    hits="$(find "$JAR_DIR" -name '*.jar' 2>/dev/null | grep -v '/ClusterIntegration_' | while read j; do
-        if grep -a -q -- "$cls" "$j" 2>/dev/null; then print "${j##*/}"; fi
-    done | head -3 | tr '\n' ' ')"
+    hits="$(jars_containing "$cls" | head -3 | sed -e 's|.*/||' | tr '\n' ' ')"
     if [[ -n "$hits" ]]; then
         print "hmi class check:   StorageMountHandler found in: $hits"
         return 0
@@ -290,20 +330,14 @@ NEW_JAR="$(ls -1t "$MOD_PATH"/ClusterIntegration_*.jar 2>/dev/null | head -1)"
 }
 
 # Java classes: on Audi without enable_carplay.txt install the Android-Auto-
-# only JAR (Update/aa_only/*_aa.jar, built by modkit/build_sd_package.sh). It
-# lacks the CarPlay classes, so the stock CarPlayDSIManager stays in charge
-# of CarPlay and only AndroidAuto2Subsystem is shadowed. The full JAR is used
-# on Porsche and on Audi with enable_carplay.txt.
-CARPLAY_HOOK=1
-[[ "$OEM" == "AU" && ! -e "$MOD_ROOT/enable_carplay.txt" ]] && CARPLAY_HOOK=0
+# only JAR (Update/aa_only/*_aa.jar, built by modkit/build_sd_package.sh,
+# presence checked in the preflight). It lacks the CarPlay classes, so the
+# stock CarPlayDSIManager stays in charge of CarPlay and only
+# AndroidAuto2Subsystem is shadowed. The full JAR is used on Porsche and on
+# Audi with enable_carplay.txt.
 if [[ $CARPLAY_HOOK -eq 0 ]]; then
-    AA_JAR="$(ls -1t "$MOD_PATH"/aa_only/ClusterIntegration_*_aa.jar 2>/dev/null | head -1)"
-    if [[ -n "$AA_JAR" && -f "$AA_JAR" ]]; then
-        NEW_JAR="$AA_JAR"
-        print "java classes:      Android Auto only (${NEW_JAR##*/}; CarPlay classes not installed)"
-    else
-        print "WARN: aa_only/ClusterIntegration_*_aa.jar not found, installing the full JAR (CarPlay classes included)"
-    fi
+    NEW_JAR="$AA_JAR"
+    print "java classes:      Android Auto only (${NEW_JAR##*/}; CarPlay classes not installed)"
 else
     print "java classes:      full JAR (${NEW_JAR##*/})"
 fi
@@ -334,45 +368,65 @@ chmod 755 "$CLUSTER_DIR/gal_cluster.so" 2>/dev/null
 chmod 755 "$CLUSTER_DIR/dio_cluster.so" 2>/dev/null
 chmod 644 "$CLUSTER_DIR/cluster_config.json" 2>/dev/null
 
+# apply_override KEY VALUE: set KEY in the top-level "config" block of the
+# installed cluster_config.json. Only a key that starts its own line inside
+# that block is touched (nested mirror / gal_h264 objects are written inline
+# and are skipped, as are carConfig, dynamicThresholds and countries). The
+# shipped file has CRLF line endings; they are dropped on rewrite so the
+# block tracking and the JSON stay consistent. Returns 1 if the key was not
+# found as a scalar in the config block (file unchanged).
+apply_override() {
+    typeset cfg
+    cfg="$CLUSTER_DIR/cluster_config.json"
+    if tr -d '\r' < "$cfg" | awk -v key="$1" -v val="$2" '
+        BEGIN { inblk = 0; done = 0 }
+        /^[ \t]*"config"[ \t]*:[ \t]*\{[ \t]*$/ { inblk = 1 }
+        inblk && !done {
+            pat = "^[ \t]*\"" key "\"[ \t]*:[ \t]*"
+            if (match($0, pat)) {
+                rest = substr($0, RLENGTH + 1)
+                if (rest !~ /^[\[{]/) {
+                    tail = rest
+                    sub(/^[^,]*/, "", tail)
+                    $0 = substr($0, 1, RLENGTH) val tail
+                    done = 1
+                }
+            }
+        }
+        inblk && /^[ \t]*\},?[ \t]*$/ { inblk = 0 }
+        { print }
+        END { if (!done) exit 3 }
+    ' > "$cfg.ovr"; then
+        mv -f "$cfg.ovr" "$cfg" && chmod 644 "$cfg" 2>/dev/null
+        return 0
+    fi
+    rm -f "$cfg.ovr"
+    return 1
+}
+
 # Per-car config overrides. Mods/ClusterIntegration/config_overrides.txt on
 # the SD card holds "key=value" lines (value written as JSON: true, false,
-# a number, or "a string"; '#' starts a comment). Each key is replaced in
-# the top-level "config" block of the installed cluster_config.json only
-# (scalar keys such as forceRHD, forceImperial, imperialSmallUnit,
-# bargraphMode, enableMapRender, aaClusterMode, heartbeatInterval). Nested
-# objects (mirror, gal_h264) and carConfig entries are not touched; use the
-# SD-card override file /fs/sda0/cluster_config.json for those. Re-running
-# without the file reinstalls the shipped config.
+# a number, or "a string"; '#' starts a comment). Each key is applied with
+# apply_override above (scalar keys of the "config" block such as forceRHD,
+# forceImperial, imperialSmallUnit, bargraphMode, enableMapRender,
+# aaClusterMode, heartbeatInterval). Nested objects (mirror, gal_h264) and
+# carConfig entries are not touched; use a carConfig entry in the installed
+# file for those. Re-running without the file reinstalls the shipped config.
 OVERRIDES="$MOD_ROOT/config_overrides.txt"
 if [[ -f "$OVERRIDES" ]]; then
-    cfg="$CLUSTER_DIR/cluster_config.json"
-    grep -v '^[ 	]*#' "$OVERRIDES" | grep '=' | while IFS='=' read -r k v; do
+    tr -d '\r' < "$OVERRIDES" | sed -e 's/[ 	]*#.*$//' -e 's/^#.*$//' | grep '=' | while IFS='=' read -r k v; do
         k="$(print -r -- "$k" | sed -e 's/^[ 	]*//' -e 's/[ 	]*$//')"
         v="$(print -r -- "$v" | sed -e 's/^[ 	]*//' -e 's/[ 	]*$//')"
         [[ -z "$k" || -z "$v" ]] && continue
-        if awk -v key="$k" -v val="$v" '
-            BEGIN { inblk = 0; done = 0 }
-            /"config"[ \t]*:[ \t]*\{/ { inblk = 1 }
-            inblk && !done {
-                pat = "\"" key "\"[ \t]*:[ \t]*[^,}]*"
-                if (match($0, pat)) {
-                    old = substr($0, RSTART, RLENGTH)
-                    sub(/^"[^"]*"[ \t]*:[ \t]*/, "", old)
-                    if (old !~ /^[\[{]/) {
-                        $0 = substr($0, 1, RSTART - 1) "\"" key "\": " val substr($0, RSTART + RLENGTH)
-                        done = 1
-                    }
-                }
-            }
-            inblk && /^[ \t]*\},?[ \t]*$/ { inblk = 0 }
-            { print }
-            END { if (!done) exit 3 }
-        ' "$cfg" > "$cfg.ovr"; then
-            mv -f "$cfg.ovr" "$cfg" && chmod 644 "$cfg" 2>/dev/null
+        # value must be a JSON scalar: true, false, a number, or a quoted string
+        if [[ "$v" != true && "$v" != false ]] && ! print -r -- "$v" | grep -q '^-\{0,1\}[0-9]\{1,\}\(\.[0-9]\{1,\}\)\{0,1\}$' && ! print -r -- "$v" | grep -q '^"[^"]*"$'; then
+            print "config override:   WARN '$k' value $v is not true/false, a number or a double-quoted string, ignored"
+            continue
+        fi
+        if apply_override "$k" "$v"; then
             print "config override:   $k = $v"
-            note "override $cfg $k=$v"
+            note "override $CLUSTER_DIR/cluster_config.json $k=$v"
         else
-            rm -f "$cfg.ovr"
             print "config override:   WARN '$k' is not a scalar key of the config block, ignored"
         fi
     done
@@ -418,15 +472,11 @@ if [[ -e "$MOD_ROOT/diag.txt" ]]; then
     # an empty cluster window must not be posted over the native map. The
     # next non-diag run reinstalls the shipped config (install_file sees the
     # difference, backs this copy up and overwrites it).
-    if sed -e 's/"enableMapRender"[ ]*:[ ]*true/"enableMapRender": false/' "$CLUSTER_DIR/cluster_config.json" > "$CLUSTER_DIR/cluster_config.json.diag" 2>/dev/null \
-       && grep -q '"enableMapRender": false' "$CLUSTER_DIR/cluster_config.json.diag"; then
-        mv -f "$CLUSTER_DIR/cluster_config.json.diag" "$CLUSTER_DIR/cluster_config.json"
-        chmod 644 "$CLUSTER_DIR/cluster_config.json" 2>/dev/null
-        note "replace $CLUSTER_DIR/cluster_config.json diag=enableMapRender:false"
+    if apply_override enableMapRender false; then
+        note "override $CLUSTER_DIR/cluster_config.json enableMapRender=false (diag)"
         print "diag mode:         installed cluster_config.json has enableMapRender=false (turn-by-turn only)"
     else
-        rm -f "$CLUSTER_DIR/cluster_config.json.diag"
-        print "diag mode:         WARN could not rewrite cluster_config.json; video path left enabled"
+        print "diag mode:         WARN could not set enableMapRender=false in cluster_config.json; video path left enabled"
     fi
     print "diag mode:         ON  ($DIAG_MARKER) - hook logs only, cluster service NOT injected"
     # Stage the stock HMI jars that contain the classes this mod shadows, so
@@ -440,11 +490,9 @@ if [[ -e "$MOD_ROOT/diag.txt" ]]; then
         de/audi/app/terminalmode/smartphone/androidauto2/AndroidAuto2Subsystem.class \
         de/audi/app/terminalmode/smartphone/carplay/CarPlayDSIManager.class \
     ; do
-        find "$JAR_DIR" -name '*.jar' 2>/dev/null | grep -v '/ClusterIntegration_' | while read refjar; do
-            if grep -a -q -- "$refcls" "$refjar" 2>/dev/null; then
-                if [[ ! -f "$REF_DIR/${refjar##*/}" ]]; then
-                    cp -p "$refjar" "$REF_DIR/${refjar##*/}" && print "hmi reference:     ${refjar##*/} -> Backup/hmi_reference/ (contains ${refcls##*/})"
-                fi
+        jars_containing "$refcls" | while read refjar; do
+            if [[ ! -f "$REF_DIR/${refjar##*/}" ]]; then
+                cp -p "$refjar" "$REF_DIR/${refjar##*/}" && print "hmi reference:     ${refjar##*/} -> Backup/hmi_reference/ (contains ${refcls##*/})"
             fi
         done
     done
@@ -464,14 +512,14 @@ fi
 # pass-through (cluster stays blank), never a crash. Object layouts cannot
 # be checked here. Output goes to the ModKit log for the first-boot review.
 check_hook_symbols() {
-    typeset lib sym c present missing
-    lib="$(find /mnt/app -name 'libautoreceiver*' 2>/dev/null | head -1)"
+    typeset lib sym present missing found
+    lib="$(find /mnt/app/eso /mnt/app/armle -name 'libautoreceiver*' 2>/dev/null | head -1)"
+    [[ -z "$lib" ]] && lib="$(find /mnt/app -name 'libautoreceiver*' 2>/dev/null | head -1)"
     if [[ -z "$lib" ]]; then
         print "hook symbols:      libautoreceiver not found under /mnt/app (check skipped)"
         return 0
     fi
-    present=0; missing=""
-    for sym in \
+    set -A HOOK_SYMS \
         _ZN13MessageRouter32populateServiceDiscoveryResponseEP24ServiceDiscoveryResponse \
         _ZN13MessageRouter13queueOutgoingEhPvj \
         _ZN13MessageRouter19sendChannelOpenRespEhi \
@@ -485,14 +533,32 @@ check_hook_symbols() {
         _ZN24NavigationStatusEndpoint29handleNavigationNextTurnEventERK23NavigationNextTurnEvent \
         _ZN24NavigationStatusEndpoint4stopEv \
         _ZN24NavigationStatusEndpoint5startEv \
-        _ZN27NavFocusRequestNotification27MergePartialFromCodedStreamEPN6google8protobuf2io16CodedInputStreamE \
-    ; do
-        c="$(grep -a -c -- "$sym" "$lib" 2>/dev/null)"
-        if [[ $? -gt 1 ]]; then
-            print "hook symbols:      grep -a unavailable on this unit (check skipped)"
-            return 0
-        fi
-        if [[ "$c" != "0" && -n "$c" ]]; then
+        _ZN27NavFocusRequestNotification27MergePartialFromCodedStreamEPN6google8protobuf2io16CodedInputStreamE
+    # One pass over the library: print every matching symbol name (-o), then
+    # compare against the list. Falls back to one grep per symbol if -o is
+    # not supported.
+    typeset symtmp symrc
+    symtmp="/tmp/cluster_symcheck.$$"
+    grep $GREP_A -o \
+        -e "${HOOK_SYMS[0]}" -e "${HOOK_SYMS[1]}" -e "${HOOK_SYMS[2]}" -e "${HOOK_SYMS[3]}" \
+        -e "${HOOK_SYMS[4]}" -e "${HOOK_SYMS[5]}" -e "${HOOK_SYMS[6]}" -e "${HOOK_SYMS[7]}" \
+        -e "${HOOK_SYMS[8]}" -e "${HOOK_SYMS[9]}" -e "${HOOK_SYMS[10]}" -e "${HOOK_SYMS[11]}" \
+        -e "${HOOK_SYMS[12]}" -e "${HOOK_SYMS[13]}" "$lib" > "$symtmp" 2>/dev/null
+    symrc=$?
+    if [[ $symrc -le 1 ]]; then
+        found="$(sort -u "$symtmp" 2>/dev/null)"
+    else
+        # grep without -o support: one plain grep per symbol
+        found=""
+        for sym in "${HOOK_SYMS[@]}"; do
+            grep $GREP_A -q -- "$sym" "$lib" 2>/dev/null && found="$found
+$sym"
+        done
+    fi
+    rm -f "$symtmp"
+    present=0; missing=""
+    for sym in "${HOOK_SYMS[@]}"; do
+        if print -r -- "$found" | grep -q -- "^$sym\$"; then
             present=$((present + 1))
         else
             missing="$missing $sym"

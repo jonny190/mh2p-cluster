@@ -19,6 +19,13 @@
 # Usage:
 #   modkit/check_hmi_signatures.sh <mod.jar> <dir-with-stock-jars>
 #
+# Pass the FULL release JAR (Update/ClusterIntegration_<version>.jar), not the
+# aa_only copy: the aa_only JAR deliberately lacks CarPlayDSIManager and
+# AndroidAuto2EventListener, and the Subsystem class is identical in both, so
+# the full JAR gives the complete comparison in one run. (The mod's
+# AndroidAuto2Subsystem makes no direct calls on AndroidAuto2EventListener,
+# so that class's comparison is informational.)
+#
 # Requires: javap (any JDK), unzip. Exit code 0 = every shadowed class found
 # in the stock jars has identical constructor/method signatures, 1 = mismatch
 # or a shadowed class was not found in the stock jars.
@@ -49,7 +56,7 @@ rc=0
 mod_entries="$(unzip -Z1 "$MOD_JAR")"
 for cls in "${SHADOWED[@]}"; do
   if ! grep -qx "$cls.class" <<<"$mod_entries"; then
-    echo "skip     $cls (not in $MOD_JAR)"
+    echo "skip     $cls (not in ${MOD_JAR##*/}; run this check with the full release JAR to compare every shadowed class)"
     continue
   fi
   ref_jar=""

@@ -23,13 +23,15 @@ else
     echo "error preload: $GAL_PRELOAD not found" >> $GAL_PRELOAD_LOG
 fi
 
-# Diagnostic mode: marker left by install.sh (Mods/ClusterIntegration/diag.txt)
-# or an ad-hoc cluster_diag.txt at the root of an inserted SD card / USB stick.
-# The hook then loads, resolves its symbols and logs the stock service
-# discovery, but does not inject the cluster service (GAL_CLUSTER_MERGE=0).
+# Diagnostic mode: marker left by install.sh when Mods/ClusterIntegration/
+# diag.txt is on the SD card (install.sh also sets enableMapRender=false in
+# the installed config so the Java side does not post an empty cluster
+# window). The hook then loads, resolves its symbols and logs the stock
+# service discovery, but does not inject the cluster service
+# (GAL_CLUSTER_MERGE=0).
 # GAL_CLUSTER_LOG is what the shipped v0034 hook reads; GAL_CLUSTER_LOG_ALL is
 # the name used by the repo source, exported too so either build logs.
-for diag in /mnt/app/eso/bin/apps/cluster/diag_mode /fs/sda0/cluster_diag.txt /fs/sdb0/cluster_diag.txt /fs/usb0_0/cluster_diag.txt; do
+for diag in /mnt/app/eso/bin/apps/cluster/diag_mode; do
     if [ -f "$diag" ]; then
         export GAL_CLUSTER_MERGE=0
         export GAL_CLUSTER_LOG=1

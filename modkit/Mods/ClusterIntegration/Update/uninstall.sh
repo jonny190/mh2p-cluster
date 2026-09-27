@@ -131,6 +131,21 @@ for j in "$JAR_DIR"/ClusterIntegration_* "$JAR_DIR"/AndroidAutoCluster_*; do
     [[ -f "$j" ]] && backup_and_remove "$j"
 done
 
+# Anything else the installer recorded as "add" under the mod's own
+# directories (future files this fixed list does not know about). Only
+# paths inside $CLUSTER_DIR or our jar name pattern are considered, so a
+# stale or edited manifest cannot make this remove stock files.
+if [[ -f "$MANIFEST" ]]; then
+    typeset addf
+    grep ' add ' "$MANIFEST" 2>/dev/null | sed -e 's/^[^ ]* add //' | sort -u | while read -r addf; do
+        case "$addf" in
+            "$CLUSTER_DIR"/*|"$JAR_DIR"/ClusterIntegration_*)
+                [[ -f "$addf" ]] && backup_and_remove "$addf"
+                ;;
+        esac
+    done
+fi
+
 if [[ -d "$CLUSTER_DIR" ]] && [[ -z "$(ls -A "$CLUSTER_DIR" 2>/dev/null)" ]]; then
     rmdir "$CLUSTER_DIR" 2>/dev/null && print "rmdir empty:       $CLUSTER_DIR"
 fi
