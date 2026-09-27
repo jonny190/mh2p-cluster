@@ -1,0 +1,32 @@
+#!/bin/ksh
+#
+# Copyright (c) 2026 fifthBro
+# https://fifthbro.github.io
+#
+# Licensed under CC BY-NC-SA 4.0
+# https://creativecommons.org/licenses/by-nc-sa/4.0/
+# NOT FOR COMMERCIAL USE
+#
+# Wrapper for `gal` that sets LD_PRELOAD=gal_cluster.so before execing the
+# real gal binary. Installed by install.sh; the original is preserved at
+# /mnt/app/eso/bin/apps/gal.real. uninstall.sh restores the original.
+
+GAL_PRELOAD="/mnt/app/eso/bin/apps/cluster/gal_cluster.so"
+GAL_PRELOAD_LOG="/tmp/gal_preload.log"
+
+echo -e "\ngal_date: $(date)"  >> $GAL_PRELOAD_LOG
+
+if [ -f $GAL_PRELOAD ]; then
+    export LD_PRELOAD=$GAL_PRELOAD
+    echo "gal preload: $GAL_PRELOAD" >> $GAL_PRELOAD_LOG
+else
+    echo "error preload: $GAL_PRELOAD not found" >> $GAL_PRELOAD_LOG
+fi
+
+echo "gal_start: $* LD_PRELOAD: $LD_PRELOAD LD_LIBRARY_PATH:$LD_LIBRARY_PATH" >> $GAL_PRELOAD_LOG
+
+/mnt/app/eso/bin/apps/gal.real "$@"
+rc=$?
+echo "gal_exit: $rc" >> $GAL_PRELOAD_LOG
+exit $rc
+

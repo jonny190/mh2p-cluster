@@ -1,0 +1,33 @@
+#!/bin/ksh
+#
+# Copyright (c) 2026 fifthBro
+# https://fifthbro.github.io
+#
+# Licensed under CC BY-NC-SA 4.0
+# https://creativecommons.org/licenses/by-nc-sa/4.0/
+# NOT FOR COMMERCIAL USE
+#
+# Wrapper for `dio_manager` that sets LD_PRELOAD=dio_cluster.so before
+# execing the real dio_manager binary. Installed by install.sh; the original
+# is preserved at /mnt/app/eso/bin/apps/dio_manager.real. uninstall.sh
+# restores the original.
+
+DIO_PRELOAD="/mnt/app/eso/bin/apps/cluster/dio_cluster.so"
+DIO_PRELOAD_LOG="/tmp/dio_preload.log"
+
+echo -e "\ndio_date: $(date)"  >> $DIO_PRELOAD_LOG
+
+if [ -f $DIO_PRELOAD ]; then
+    export LD_PRELOAD=$DIO_PRELOAD
+    echo "dio_preload: $DIO_PRELOAD" found >> $DIO_PRELOAD_LOG
+else
+    echo "error preload: $DIO_PRELOAD not found" >> $DIO_PRELOAD_LOG
+fi
+
+echo "dio_start: $* LD_PRELOAD: $LD_PRELOAD LD_LIBRARY_PATH:$LD_LIBRARY_PATH" >> $DIO_PRELOAD_LOG
+
+/mnt/app/eso/bin/apps/dio_manager.real "$@"
+rc=$?
+echo "dio_exit: $rc" >> $DIO_PRELOAD_LOG
+exit $rc
+
