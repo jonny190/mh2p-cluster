@@ -14,6 +14,9 @@
 #   and moves gal.real back to gal.
 # - Same for dio_manager.
 # - Backs up and removes JAR + native binaries from their install dirs.
+# - If NAME.real is missing but NAME is still our wrapper, restores the
+#   original from Backup/NAME.real on the SD card.
+# - Appends what it did to Backup/manifest.txt.
 
 set -u
 
@@ -40,6 +43,18 @@ mkdir -p "$BACKUP_DIR" || { print -u2 "ERROR: cannot mkdir $BACKUP_DIR"; exit 2;
 
 ts() { date +"%Y%m%d_%H%M%S"; }
 
+MANIFEST="$BACKUP_DIR/manifest.txt"
+RUN_TS="$(ts)"
+note() { print "$RUN_TS $*" >> "$MANIFEST" 2>/dev/null; }
+note "run   uninstall $RELEASE_VERSION"
+
+is_wrapper_script() {
+    # Our wrappers start with "#!/bin/ksh"; the real binaries are ELF.
+    # dd is what the ModKit itself uses for this kind of check on QNX.
+    [[ -f "$1" ]] || return 1
+    [[ "$(dd if="$1" bs=1 count=10 2>/dev/null)" == "#!/bin/ksh" ]]
+}
+
 print "Slaying running processes before uninstall..."
 for proc in cluster gal gal.real dio_manager dio_manager.real; do
     slay -f "$proc" 2>/dev/null
@@ -56,8 +71,24 @@ restore_wrapped_binary() {
     name="$1"
     dst_active="$APPS_DIR/$name"
     dst_real="$APPS_DIR/${name}.real"
+    sd_real_backup="$BACKUP_DIR/${name}.real"
 
     if [[ ! -f "$dst_real" ]]; then
+        # Fallback: .real is gone but our wrapper is still in place and the
+        # SD card still holds the stable-name copy of the original binary.
+        if is_wrapper_script "$dst_active" && [[ -f "$sd_real_backup" ]]; then
+            bk="$BACKUP_DIR/${name}.wrapper.removed.$(ts)"
+            cp -p "$dst_active" "$bk" 2>/dev/null && print "backup wrapper:    $dst_active -> $bk"
+            cp -p "$sd_real_backup" "$dst_active" || { print -u2 "ERROR: restore from $sd_real_backup failed"; return 2; }
+            chmod 755 "$dst_active"
+            print "restore original:  $sd_real_backup -> $dst_active (from SD backup)"
+            note "restore $dst_active from=$sd_real_backup"
+            return 0
+        fi
+        if is_wrapper_script "$dst_active"; then
+            print -u2 "ERROR: $dst_active is our wrapper but neither $dst_real nor $sd_real_backup exists - cannot restore $name"
+            return 3
+        fi
         print "skip restore:      $name (no $dst_real present)"
         return 0
     fi
@@ -68,6 +99,7 @@ restore_wrapped_binary() {
     fi
     mv "$dst_real" "$dst_active" || { print -u2 "ERROR: mv $name.real -> $name failed"; return 2; }
     print "restore original:  $dst_real -> $dst_active"
+    note "restore $dst_active from=$dst_real"
 }
 
 backup_and_remove() {
@@ -80,6 +112,7 @@ backup_and_remove() {
     cp -p "$f" "$bk" || { print -u2 "ERROR: backup failed: $f"; return 2; }
     rm -f "$f"
     print "remove:            $f -> $bk"
+    note "remove $f backup=$bk"
 }
 
 # need our .so files until processes restart, but removing them after the

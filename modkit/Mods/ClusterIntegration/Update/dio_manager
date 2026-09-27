@@ -26,6 +26,11 @@ fi
 
 echo "dio_start: $* LD_PRELOAD: $LD_PRELOAD LD_LIBRARY_PATH:$LD_LIBRARY_PATH" >> $DIO_PRELOAD_LOG
 
+if [ ! -x /mnt/app/eso/bin/apps/dio_manager.real ]; then
+    echo "error: /mnt/app/eso/bin/apps/dio_manager.real missing, cannot start dio_manager (restore it from Backup/dio_manager.real on the SD card)" >> $DIO_PRELOAD_LOG
+    exit 127
+fi
+
 /mnt/app/eso/bin/apps/dio_manager.real "$@"
 rc=$?
 echo "dio_exit: $rc" >> $DIO_PRELOAD_LOG

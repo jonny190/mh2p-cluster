@@ -25,6 +25,11 @@ fi
 
 echo "gal_start: $* LD_PRELOAD: $LD_PRELOAD LD_LIBRARY_PATH:$LD_LIBRARY_PATH" >> $GAL_PRELOAD_LOG
 
+if [ ! -x /mnt/app/eso/bin/apps/gal.real ]; then
+    echo "error: /mnt/app/eso/bin/apps/gal.real missing, cannot start gal (restore it from Backup/gal.real on the SD card)" >> $GAL_PRELOAD_LOG
+    exit 127
+fi
+
 /mnt/app/eso/bin/apps/gal.real "$@"
 rc=$?
 echo "gal_exit: $rc" >> $GAL_PRELOAD_LOG

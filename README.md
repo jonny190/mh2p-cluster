@@ -174,10 +174,11 @@ The Porsche PCM5 HMI is built on Audi's framework: every platform class this mod
 
 ### What the Audi package changes
 
-- `install.sh` accepts `OEM=AU` in addition to `PO`. Porsche keeps its firmware check (26xx / 28xx). Audi firmware numbering has not been mapped, so no range is enforced for Audi; the detected string is logged instead.
-- Other OEMs still abort. `Mods/ClusterIntegration/force_install.txt` on the SD card overrides the OEM and firmware gate for people who know what they are doing.
+- `install.sh` accepts `OEM=AU` in addition to `PO`, with the same 26xx / 28xx firmware range. Audi MH2p units share Porsche's version numbering: the first reported Audi string is `MH2p_ER_AUG35_P2873` (e-tron 55 quattro, EU), which the gate accepts.
+- Other OEMs and out-of-range firmware still abort. `Mods/ClusterIntegration/force_install.txt` on the SD card overrides the OEM and firmware gate for people who know what they are doing.
 - A preflight check aborts before changing anything if `/mnt/app/eso/hmi/lsd/jars` or `/mnt/app/eso/bin/apps` is missing.
-- `uninstall.sh` no longer checks the OEM. It only restores what the mod changed, so it is safe everywhere.
+- Every change is recorded in `Mods/ClusterIntegration/Update/Backup/manifest.txt` with the backup copy it made (see [Backups and rollback](#backups-and-rollback)).
+- `uninstall.sh` no longer checks the OEM. It only restores what the mod changed, so it is safe everywhere. `Update/rollback.sh` runs it over SSH without the ModKit.
 
 The scripts are tracked under `modkit/`, and `modkit/build_sd_package.sh` rebuilds a flashable zip from any release zip:
 
@@ -189,7 +190,7 @@ modkit/build_sd_package.sh builds/ClusterIntegration_v0034_beta2_candidate_90d0b
 ### Install on an Audi
 
 1. Use `builds/ClusterIntegration_v0034_beta2_candidate_90d0b76_audi.zip` and follow the normal Installation steps above. Android Auto must already be activated on the unit.
-2. After the unit reboots, pull the SD card and read `Logs/ClusterIntegration.log`. The first useful line is `Head unit: release=MH2p_.._AU..._P.... oem=AU ...`. If it says `Aborting`, the gate refused; if it says `ERROR`, the preflight refused; otherwise every `install:` line names a file that was written.
+2. After the unit reboots, pull the SD card and read `Logs/ClusterIntegration.log`. The first useful line is `Head unit: release=MH2p_ER_AUG35_P2873 oem=AU type=G35 region=ER sw=2873 force=0` (your values will differ). If it says `Aborting`, the gate refused; if it says `ERROR`, the preflight or a backup check refused; otherwise every `install:` line names a file that was written and `Backups:` names the folder holding the originals.
 3. Put the SD card back in with the ignition on, connect the phone, and start navigation in Google Maps or Waze.
 
 ### First-boot checklist
@@ -219,7 +220,7 @@ Per-car values live in `cluster_config.json`. The copy on the SD card root (`/fs
 }
 ```
 
-Without an entry the global `config.mirror` and `config.gal_h264` values apply, which is a reasonable first try. Fit and framing are tuned with `gal_h264.mode`, `zoomX`/`zoomY`, `panX`/`panY` and `codecRes` (720 or 480); `cluster capture=test verbose=1 zoomX=.. panX=..` over SSH draws a calibration pattern with the same numbers.
+Without an entry the global `config.mirror` and `config.gal_h264` values apply, which is a reasonable first try. Note that the native `gal_cluster.so` picks its own per-car settings by Porsche part-number prefix (it queries the head unit's part number and knows 9Y1/9YA/992/971/95B), so on an Audi it uses its global or compiled defaults regardless of the `carConfig` key; the Java side still honours your entry. Fit and framing are tuned with `gal_h264.mode`, `zoomX`/`zoomY`, `panX`/`panY` and `codecRes` (720 or 480); `cluster capture=test verbose=1 zoomX=.. panX=..` over SSH draws a calibration pattern with the same numbers.
 
 If the daemon logs `auto=fail`, the cluster video link is not QNX displayable `33` on your car. That id is compiled into the `cluster` binary and cannot be changed with arguments (`xres=`/`yres=` only size the test pattern and the blit rectangle inside the video-sized window, and values larger than the stream break the blit), so it needs a rebuild of `src/cluster.c` with a `dispid=` argument. Enumerate the displays first with `cluster capture=display verbose=1` (one `disp[n]: id=.. size=..` line per display; Ctrl-C to stop) to learn the real id and size.
 
@@ -232,11 +233,25 @@ If the daemon logs `auto=fail`, the cluster video link is not QNX displayable `3
 - The `carClass`/`generation` values for the e-tron (read them from the log and please report them back).
 - The shipped `cluster`, `gal_cluster.so` and JAR in `builds/` are newer than the sources in `src/` and `lsd/` (extra log lines, the `carConfig` schema, config reading in the hook). A rebuild from this repository would regress them, so the Audi port deliberately reuses the release binaries unchanged.
 
-### Recovery
+### Backups and rollback
 
-- Put an empty `uninstall.txt` in `Mods/ClusterIntegration/` on the SD card and boot with it inserted: the ModKit runs `uninstall.sh`, which restores `gal` and `dio_manager` and removes the JAR and cluster daemon.
-- If the unit boot-loops, a `failsafe.sh` at the root of the SD card runs early in boot (ModKit feature); the simplest one copies `uninstall.sh`'s steps.
-- Backups of every replaced file are kept in `Mods/ClusterIntegration/Update/Backup/` on the SD card.
+The installer never overwrites a file without first copying it to `Mods/ClusterIntegration/Update/Backup/` on the SD card and verifying the copy (size and checksum); if the backup cannot be verified, that file is skipped. What ends up where:
+
+| Original | Kept on the head unit as | Copy on the SD card |
+|---|---|---|
+| `/mnt/app/eso/bin/apps/gal` | `gal.real` (the wrapper execs it) | `Backup/gal.real` and `Backup/gal.original.<timestamp>` |
+| `/mnt/app/eso/bin/apps/dio_manager` | `dio_manager.real` | `Backup/dio_manager.real` and `Backup/dio_manager.original.<timestamp>` |
+| an older `ClusterIntegration_*.jar` or cluster file being replaced | removed | `Backup/<name>.backup.<timestamp>` |
+
+Everything else the mod installs (the JAR, `cluster`, the two `.so` files, `cluster_config.json`) is new on a stock unit and is listed as `add` in `Backup/manifest.txt`; rollback deletes it. The manifest has one line per action (`add`, `replace`, `swap`, `remove`, `restore`) with the backup path, appended on every run.
+
+To roll back:
+
+- **With the ModKit:** put an empty `uninstall.txt` in `Mods/ClusterIntegration/` on the SD card and boot with it inserted. `uninstall.sh` restores `gal` and `dio_manager` from their `.real` originals (falling back to `Backup/*.real` on the card if `.real` is missing), removes the added files (backing each one up as `*.removed.<timestamp>`), and records what it did in the manifest.
+- **Over SSH:** `ksh /fs/sda0/Mods/ClusterIntegration/Update/rollback.sh` does the same without a reboot cycle (the card may be on `/fs/sdb0` or `/fs/usb0_0` on your unit).
+- **Boot loop or dead Android Auto:** the ModKit runs a `failsafe.sh` from the root of the SD card early in every boot. A ready-made one ships as `Mods/ClusterIntegration/failsafe.sh` (inert there); copy it to the card's root, boot once with the card in, then delete it from the root again or it rolls back on every boot. Output goes to `Logs/ClusterIntegration-failsafe.log`.
+
+Keep the SD card: it is the only place the timestamped history lives. A factory firmware update rewrites `/mnt/app` and removes the mod along with the `.real` files anyway.
 
 ---
 

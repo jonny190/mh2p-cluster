@@ -22,6 +22,9 @@
 #   The original binary is preserved at /mnt/app/eso/bin/apps/gal.real so
 #   uninstall.sh can restore it.
 # - Same for dio_manager.
+# - Writes Backup/manifest.txt (add / replace / swap / remove lines with the
+#   backup path for each) so every change can be rolled back; uninstall.sh
+#   or rollback.sh performs the rollback.
 #
 
 set -u
@@ -54,26 +57,31 @@ print "Head unit:         release=$RELEASE_VERSION oem=$OEM type=$TYPE region=$R
 
 # Supported head units:
 #   PO  Porsche PCM5 (MH2P) firmware 26xx / 28xx     - tested
-#   AU  Audi MH2p (e.g. e-tron GE, A6 C8, Q8)         - EXPERIMENTAL, untested
+#   AU  Audi MH2p firmware 26xx / 28xx               - EXPERIMENTAL
+#       (known Audi string: MH2p_ER_AUG35_P2873, e-tron 55 quattro, EU)
 # Anything else aborts unless force_install.txt is present.
 case "$OEM" in
-    PO)
+    PO|AU)
+        if [[ "$OEM" == "PO" ]]; then
+            brand="Porsche"
+        else
+            brand="Audi"
+        fi
         if [[ "$SOFTWARE_VERSION" != 26?? && "$SOFTWARE_VERSION" != 28?? ]]; then
             if [[ $FORCE_INSTALL -eq 1 ]]; then
-                print "WARNING: Porsche firmware $RELEASE_VERSION outside tested range (26xx / 28xx), continuing because force_install.txt is present."
+                print "WARNING: $brand firmware $RELEASE_VERSION outside tested range (26xx / 28xx), continuing because force_install.txt is present."
             else
                 print "Firmware $RELEASE_VERSION not in supported range (26xx / 28xx). Aborting."
                 print "To override, create Mods/ClusterIntegration/force_install.txt on the SD card."
                 exit 0
             fi
         else
-            print "Porsche firmware $RELEASE_VERSION OK, installing..."
+            print "$brand firmware $RELEASE_VERSION OK, installing..."
         fi
-        ;;
-    AU)
-        print "Audi MH2p head unit $RELEASE_VERSION detected. Audi support is EXPERIMENTAL."
-        print "No Audi firmware range has been validated yet, so the Porsche 26xx/28xx check is skipped."
-        print "If Android Auto or CarPlay stop working: put uninstall.txt in Mods/ClusterIntegration/ and re-run the ModKit."
+        if [[ "$OEM" == "AU" ]]; then
+            print "Audi support is EXPERIMENTAL: the JAR and native hooks were built against Porsche PCM5."
+            print "If Android Auto or CarPlay stop working: put uninstall.txt in Mods/ClusterIntegration/ and re-run the ModKit."
+        fi
         ;;
     *)
         if [[ $FORCE_INSTALL -eq 1 ]]; then
@@ -110,6 +118,17 @@ mkdir -p "$BACKUP_DIR" || { print -u2 "ERROR: cannot mkdir $BACKUP_DIR"; exit 2;
 mkdir -p "$CLUSTER_DIR"
 
 ts() { date +"%Y%m%d_%H%M%S"; }
+
+# Change manifest: one line per file the installer adds, replaces, swaps or
+# removes, with the backup copy it made. Appended on every run so the
+# history of the head unit's modifications stays on the SD card.
+# Rollback = uninstall.sh (via uninstall.txt + ModKit, or Update/rollback.sh
+# over SSH): restores gal/dio_manager from .real (or from Backup/ if .real
+# is gone) and removes everything listed as "add".
+MANIFEST="$BACKUP_DIR/manifest.txt"
+RUN_TS="$(ts)"
+note() { print "$RUN_TS $*" >> "$MANIFEST" 2>/dev/null; }
+note "run   install $RELEASE_VERSION"
 
 print "Slaying running processes before install..."
 for proc in cluster gal gal.real dio_manager dio_manager.real; do
@@ -148,7 +167,12 @@ install_file() {
     if [[ -f "$dst" ]]; then
         bk="$BACKUP_DIR/${dst##*/}.backup.$(ts)"
         cp -p "$dst" "$bk" || { print -u2 "ERROR: backup failed: $dst"; return 2; }
+        # Never overwrite a file whose backup is not a verified copy.
+        files_identical "$dst" "$bk" || { print -u2 "ERROR: backup verify failed: $bk"; rm -f "$bk"; return 2; }
         print "backup target:     $dst -> $bk"
+        note "replace $dst backup=$bk"
+    else
+        note "add $dst"
     fi
     cp -p "$src" "$dst" || { print -u2 "ERROR: copy failed: $src -> $dst"; return 3; }
     print "install:           $dst"
@@ -200,12 +224,15 @@ swap_binary_for_wrapper() {
     # Timestamped historical backup (each run gets its own).
     bk="$BACKUP_DIR/${name}.original.$(ts)"
     cp -p "$dst_active" "$bk" || { print -u2 "ERROR: backup of original $name failed"; return 2; }
+    files_identical "$dst_active" "$bk" || { print -u2 "ERROR: backup verify failed: $bk"; rm -f "$bk"; return 2; }
     print "backup original:   $dst_active -> $bk"
     # Stable-name local backup (always reflects the original binary content).
     cp -p "$dst_active" "$local_real_backup" && \
         print "backup .real:      $dst_active -> $local_real_backup"
+    files_identical "$dst_active" "$local_real_backup" || { print -u2 "ERROR: backup verify failed: $local_real_backup"; return 2; }
     mv "$dst_active" "$dst_real" || { print -u2 "ERROR: mv $name -> $name.real failed"; return 3; }
     print "preserve original: $dst_active -> $dst_real"
+    note "swap $dst_active original=$dst_real backup=$bk"
     cp -p "$wrapper_src" "$dst_active" || { print -u2 "ERROR: install wrapper failed"; return 4; }
     chmod 755 "$dst_active"
     print "install wrapper:   $dst_active"
@@ -222,7 +249,7 @@ typeset j
 for j in "$JAR_DIR"/ClusterIntegration_* "$JAR_DIR"/AndroidAutoCluster_*; do
     if [[ -f "$j" && "${j##*/}" != "${NEW_JAR##*/}" ]]; then
         bk="$BACKUP_DIR/${j##*/}.backup.$(ts)"
-        cp -p "$j" "$bk" && rm -f "$j" && print "remove old jar:    $j -> $bk"
+        cp -p "$j" "$bk" && rm -f "$j" && print "remove old jar:    $j -> $bk" && note "remove $j backup=$bk"
     fi
 done
 
@@ -248,5 +275,8 @@ swap_binary_for_wrapper dio_manager
 
 sync
 print ""
+print "Backups:           $BACKUP_DIR (manifest.txt lists every change)"
+print "Rollback:          put uninstall.txt in Mods/ClusterIntegration/ and re-run the ModKit,"
+print "                   or over SSH: ksh $MOD_PATH/rollback.sh"
 print "Done."
 
