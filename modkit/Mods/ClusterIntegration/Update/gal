@@ -60,13 +60,21 @@ fi
 
 # The cluster daemon is started by the Persist script during a full boot.
 # After an HMI restart (MMI knob) or a killed daemon nothing restarts it and
-# the cockpit keeps the Audi map, so start it here when it is missing. The
-# bracket in the pattern keeps this grep from matching its own command line.
+# the cockpit keeps the Audi map, so start it here when it is missing. Only
+# one daemon may run (two steal each other's commands): the starter records
+# its pid in /tmp/cluster_daemon.pid, checked through /proc/<pid> with shell
+# built-ins (pidin/grep are not reliably reachable here, and kill -0 fails
+# when this runs as another user than the daemon).
 CLUSTER_BIN=/mnt/app/eso/bin/apps/cluster/cluster
+DAEMON_PID=/tmp/cluster_daemon.pid
 if [ -x "$CLUSTER_BIN" ]; then
-    if ! PATH="$PATH:/bin:/usr/bin:/mnt/app/armle/usr/bin:/mnt/app/armle/bin" pidin ar 2>/dev/null | grep 'cluster[ ]daemon' >/dev/null 2>&1; then
-        "$CLUSTER_BIN" daemon verbose=2 >/dev/null 2>&1 &
-        echo "cluster daemon: not running, started by the gal wrapper (pid $!)" >> $GAL_PRELOAD_LOG
+    if { read p < "$DAEMON_PID" && [ -n "$p" ] && [ -d "/proc/$p" ]; } 2>/dev/null; then
+        echo "cluster daemon: already running (pid $p)" >> $GAL_PRELOAD_LOG
+    else
+        "$CLUSTER_BIN" daemon >/dev/null 2>&1 &
+        p=$!
+        echo $p > "$DAEMON_PID" 2>/dev/null
+        echo "cluster daemon: not running, started by the gal wrapper (pid $p, pid file written: $?)" >> $GAL_PRELOAD_LOG
     fi
 fi
 

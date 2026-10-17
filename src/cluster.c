@@ -2664,10 +2664,17 @@ int run_h264_mode(int argc, char** argv) {
         }
     }
 
-    /* Main decode loop: read from SHM, feed to parser. Start from CURRENT
-     * write position so we get fresh data with valid NAL boundaries. */
-    uint32_t read_pos = shm->write_pos;
-    uint32_t last_total = shm->total_bytes;
+    /* Main decode loop: read from SHM, feed to parser. Start from the ring
+     * start, not the current write position: the hook writes the session's
+     * SPS/PPS and first IDR into the ring before this child is resumed, and
+     * starting at write_pos skipped them, so the decoder waited for the next
+     * keyframe (black cockpit until a reconnect). The Q7 build
+     * (builds/ClusterIntegration_v0034_q7_p2711_audi.zip) carries the same
+     * change as a 2-instruction patch. Note: assumes the ring has not
+     * wrapped before the first read; read from the last SPS offset if
+     * sessions ever start with >2 MB queued. */
+    uint32_t read_pos = 0;
+    uint32_t last_total = 0;
     int feed_count = 0;
     uint64_t t0 = now_us();
     (void)t0;

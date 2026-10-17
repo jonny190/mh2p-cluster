@@ -42,6 +42,7 @@ import de.audi.app.terminalmode.smartphone.androidauto2.audio.AndroidAuto2AudioH
 import de.audi.app.terminalmode.smartphone.androidauto2.mic.AndroidAuto2MicHandler;
 import de.audi.app.terminalmode.smartphone.androidauto2.nav.AndroidAuto2NavHandler;
 import de.audi.app.terminalmode.smartphone.androidauto2.nav.AndroidAutoClusterIntegration;
+import de.audi.app.terminalmode.smartphone.androidauto2.nav.KombiMapGuard;
 import de.audi.app.terminalmode.smartphone.androidauto2.video.AndroidAuto2VideoHandler;
 import de.audi.atip.interapp.combi.bap.navi.CombiBAPServiceNavi;
 import de.audi.atip.interapp.combi.bap.audio.CombiBAPServiceAudio;
@@ -365,6 +366,8 @@ IDSIControllerStateListener {
         androidAuto2ListenerDistributor.addListener(new DSIAndroidAuto2ListenerSafe[]{androidAuto2RequestHandler, androidAuto2EventListener, androidAuto2AudioHandler, androidAuto2MicHandler, androidAuto2NavHandler, androidAuto2VideoHandler, androidAuto2VoiceSessionHandler, this.clusterIntegration});
         this.stateHandler = iStateHandler;
         this.logger.log(1000000, "[%1.<init>] AndroidAutoClusterIntegration registered with listener distributor", (Object)LOGCLASS);
+        // Hide the native cockpit map while the AA cluster video renders (Audi Q7 P2711).
+        KombiMapGuard.start(iContext, this.clusterIntegration);
     }
 
     public void init() {

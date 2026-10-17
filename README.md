@@ -168,6 +168,8 @@ The easiest way is to just scp it to the target if you <a href="https://github.c
 
 ## Audi MH2p (e-tron and other MLBevo Audis) — experimental
 
+> **Audi Q7 (P2711) profile:** full-width map in the Virtual Cockpit with the car marker above Audi's bottom bar, native-map hiding, and fixes for a black cockpit and repeated reconnects. See [audi/q7-p2711](audi/q7-p2711/README.md).
+
 > **Status:** running on an e-tron 55 (`MH2p_ER_AUG35_P2873`, UK, RHD): the shadowed Java class loads, turn-by-turn services are found, the phone streams the cluster map and the virtual cockpit shows it; what is still being tuned is the window size on the 1920x722 cockpit and the hand-back to the Audi map when Android Auto ends (see the Audi sections below). The port changes the install gate and packaging: the native binaries and the config are byte-identical to the Porsche release, the Java classes are the release classes (on Audi the installer uses a copy of the JAR with the CarPlay classes dropped) plus one added class, a no-op stand-in for the Porsche-only `StorageMountHandler` that the Audi HMI does not ship.
 
 ### Why it might just work
