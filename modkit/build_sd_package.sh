@@ -141,6 +141,21 @@ for f in "$PKG"/Mods/ClusterIntegration/Update/aa_only/ClusterIntegration_*_aa.j
         || { echo "error: build_aa_jar.sh failed for ${f##*/}; set STOCK_CLASSES / ECJ_JAR (see modkit/build_aa_jar.sh)" >&2; exit 1; }
 done
 
+# Cockpit loading splash. With modkit/splash/splash.png present (or
+# SPLASH_PNG=<file>), the boot splash compiled into the cluster daemon is
+# swapped for it: a same-length overwrite of the zlib stream inside the
+# binary, verified by decompressing the result (modkit/splash/canim_tool.py).
+# Without the file the daemon ships as released. The tool aborts when the
+# image does not fit the original stream's length.
+SPLASH_PNG="${SPLASH_PNG:-$HERE/splash/splash.png}"
+if [[ -f "$SPLASH_PNG" ]]; then
+    CLUSTER_BIN="$PKG/Mods/ClusterIntegration/Update/cluster"
+    python3 "$HERE/splash/canim_tool.py" build "$SPLASH_PNG" "$WORK/splash.canim" | sed 's/^/  splash:  /'
+    python3 "$HERE/splash/canim_tool.py" patch "$CLUSTER_BIN" "$WORK/splash.canim" "$WORK/cluster.patched" | sed 's/^/  splash:  /'
+    cp "$WORK/cluster.patched" "$CLUSTER_BIN" && chmod 755 "$CLUSTER_BIN"
+    echo "  splash:  Mods/ClusterIntegration/Update/cluster boot splash replaced from ${SPLASH_PNG##*/}"
+fi
+
 # Keep the tracked copy of the derived Audi jar in step with the package, so
 # the overlay in this repository ships the same bytes the build produced.
 for f in "$PKG"/Mods/ClusterIntegration/Update/aa_only/ClusterIntegration_*_aa.jar; do

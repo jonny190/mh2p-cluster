@@ -12,7 +12,7 @@ Three pieces run on the head unit (QNX 6.6 on NVIDIA Tegra, IBM J9 JVM at Java 1
 - **Native hook** (`src/gal_cluster.c`): `LD_PRELOAD`ed into the Android Auto receiver `gal` by a ksh wrapper that replaces `/mnt/app/eso/bin/apps/gal` (original kept as `gal.real`). It interposes libautoreceiver C++ symbols, injects a cluster VideoSink service (ids 14/21) into the head unit's service discovery response, and copies the phone's cluster H.264 stream into shared memory. `src/dio_manager_preload.c` is the CarPlay equivalent (route guidance over iAP2), Porsche only.
 - **Cluster daemon** (`src/cluster.c`): decodes the stream with NvMedia and posts it as a QNX Screen window bound to displayable `33`, the cluster map slot; it sizes that window to the detected cluster display (`DISP_W`/`DISP_H`) and blits with `mode` letter/fill/stretch plus zoom/pan from the `prepare` command the Java side sends. `cluster_config.json` (installed next to the daemon, overridable by a copy at an SD/USB root) is read by all three.
 
-The shipped binaries and most JAR classes in `builds/` are **newer than the sources** in `src/` and `lsd/` (extra logging, display auto-detection, the `carConfig` schema; `AndroidAutoClusterIntegration` has zoom fields the source lacks). Treat the sources as documentation of behaviour, verify against the binaries (`strings`, `javap`, capstone with the daemon's intact symbol table), and never rebuild from `src/` expecting parity. Two exceptions, rebuilt by `modkit/build_aa_jar.sh`: `AndroidAuto2Subsystem` (its source was checked equal to the shipped class, `javap -c` with compiler idioms normalised, 2026-10-17) and the classes this fork adds under `lsd/`. The compiler is ECJ 3.20 at `-source 1.4 -target 1.4` (`~/.cache/ecj-3.20.0.jar`, see the script header): the HMI's J9 loads class-file version 48 and its library is Java 1.4 level, so no generics, autoboxing, `StringBuilder` or class literals in the sources this fork compiles. There is no QNX toolchain here; nothing native is rebuilt in this repository.
+The shipped binaries and most JAR classes in `builds/` are **newer than the sources** in `src/` and `lsd/` (extra logging, display auto-detection, the `carConfig` schema; `AndroidAutoClusterIntegration` has zoom fields the source lacks). Treat the sources as documentation of behaviour, verify against the binaries (`strings`, `javap`, capstone with the daemon's intact symbol table), and never rebuild from `src/` expecting parity. Two exceptions, rebuilt by `modkit/build_aa_jar.sh`: `AndroidAuto2Subsystem` (its source was checked equal to the shipped class, `javap -c` with compiler idioms normalised, 2026-10-17) and the classes this fork adds under `lsd/`. The compiler is ECJ 3.20 at `-source 1.4 -target 1.4` (`~/.cache/ecj-3.20.0.jar`, see the script header): the HMI's J9 loads class-file version 48 and its library is Java 1.4 level, so no generics, autoboxing, `StringBuilder` or class literals in the sources this fork compiles. There is no QNX toolchain here; nothing native is rebuilt in this repository. The one native change is a byte patch: `modkit/splash/canim_tool.py` swaps the boot splash zlib stream embedded in `cluster` (unique offset, same-length overwrite, verified by decompressing), driven by `modkit/splash/splash.png` in `build_sd_package.sh`.
 
 ## Install mechanics (modkit/)
 
@@ -39,6 +39,11 @@ modkit/build_sd_package.sh builds/ClusterIntegration_v0034_beta2_candidate_90d0b
 # Recompile only this fork's Java (AndroidAuto2Subsystem, nav/KombiMapHandback)
 # into the tracked aa_only jar; checks class-file version 48 and no StringBuilder
 modkit/build_aa_jar.sh [~/etron-stock/lsd] [~/.cache/ecj-3.20.0.jar]
+
+# Cockpit loading splash (pure Python, no Pillow): inspect / export / build /
+# patch / e-tron preview; build_sd_package.sh applies modkit/splash/splash.png
+modkit/splash/canim_tool.py info builds/<extracted>/Update/cluster
+modkit/splash/canim_tool.py preview modkit/splash/splash.png /tmp/preview.png
 
 # Rebuild the StorageMountHandler stand-in (JDK required) and its jar under Update/audi/
 modkit/stub/build_stub.sh
