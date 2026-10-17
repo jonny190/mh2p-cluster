@@ -8,11 +8,11 @@ A mod for Porsche PCM5 / Audi MH2p (MIB2+) head units that puts Android Auto (an
 
 Three pieces run on the head unit (QNX 6.6 on NVIDIA Tegra, IBM J9 JVM at Java 1.4 class-file level, OSGi HMI):
 
-- **Java** (`lsd/`): classes dropped into `/mnt/app/eso/hmi/lsd/jars/` shadow stock HMI classes, because `lsd.sh` puts every jar in that directory on `-Xbootclasspath` ahead of `/ifs/lsd.jxe` (with `-noverify`). `AndroidAuto2Subsystem` is the shadowed stock class; it constructs `nav/AndroidAutoClusterIntegration`, the bridge from the Android Auto DSI listener callbacks to `CombiBAPServiceNavi` (BAP) and to the cluster daemon (through the `/tmp/cluster_ctl` FIFO). `AndroidAuto2EventListener` is shadowed too: its constructor is the only place that subscribes the DSI attributes, and the mod's copy subscribes 7 and 8 (next turn, distance), which stock Audi does not.
+- **Java** (`lsd/`): classes dropped into `/mnt/app/eso/hmi/lsd/jars/` shadow stock HMI classes, because `lsd.sh` puts every jar in that directory on `-Xbootclasspath` ahead of `/ifs/lsd.jxe` (with `-noverify`). `AndroidAuto2Subsystem` is the shadowed stock class; it constructs `nav/AndroidAutoClusterIntegration`, the bridge from the Android Auto DSI listener callbacks to `CombiBAPServiceNavi` (BAP) and to the cluster daemon (through the `/tmp/cluster_ctl` FIFO). `AndroidAuto2EventListener` is shadowed too: its constructor is the only place that subscribes the DSI attributes, and the mod's copy subscribes 7 and 8 (next turn, distance), which stock Audi does not. `nav/KombiMapHandback` (this fork, Audi JAR only) tracks `de.audi.tghu.navi.app.cluster.IMapClusterService` by name with an OSGi `ServiceTracker` and, when the session ends, calls `switchKombiMapToHiddenContext()` then `switchKombiMapToAShownContext()` by reflection so the cockpit returns to the Audi map; `AndroidAuto2Subsystem` constructs it and calls it from `activate()`, `deactivate()` and `dsiUnavailable()`. It logs with the `KOMBI_MAP:` prefix.
 - **Native hook** (`src/gal_cluster.c`): `LD_PRELOAD`ed into the Android Auto receiver `gal` by a ksh wrapper that replaces `/mnt/app/eso/bin/apps/gal` (original kept as `gal.real`). It interposes libautoreceiver C++ symbols, injects a cluster VideoSink service (ids 14/21) into the head unit's service discovery response, and copies the phone's cluster H.264 stream into shared memory. `src/dio_manager_preload.c` is the CarPlay equivalent (route guidance over iAP2), Porsche only.
 - **Cluster daemon** (`src/cluster.c`): decodes the stream with NvMedia and posts it as a QNX Screen window bound to displayable `33`, the cluster map slot; it sizes that window to the detected cluster display (`DISP_W`/`DISP_H`) and blits with `mode` letter/fill/stretch plus zoom/pan from the `prepare` command the Java side sends. `cluster_config.json` (installed next to the daemon, overridable by a copy at an SD/USB root) is read by all three.
 
-The shipped binaries and JAR in `builds/` are **newer than the sources** in `src/` and `lsd/` (extra logging, display auto-detection, the `carConfig` schema). Treat the sources as documentation of behaviour, verify against the binaries (`strings`, `javap`, capstone with the daemon's intact symbol table), and never rebuild from `src/` expecting parity. There is no QNX toolchain here; nothing native is rebuilt in this repository.
+The shipped binaries and most JAR classes in `builds/` are **newer than the sources** in `src/` and `lsd/` (extra logging, display auto-detection, the `carConfig` schema; `AndroidAutoClusterIntegration` has zoom fields the source lacks). Treat the sources as documentation of behaviour, verify against the binaries (`strings`, `javap`, capstone with the daemon's intact symbol table), and never rebuild from `src/` expecting parity. Two exceptions, rebuilt by `modkit/build_aa_jar.sh`: `AndroidAuto2Subsystem` (its source was checked equal to the shipped class, `javap -c` with compiler idioms normalised, 2026-10-17) and the classes this fork adds under `lsd/`. The compiler is ECJ 3.20 at `-source 1.4 -target 1.4` (`~/.cache/ecj-3.20.0.jar`, see the script header): the HMI's J9 loads class-file version 48 and its library is Java 1.4 level, so no generics, autoboxing, `StringBuilder` or class literals in the sources this fork compiles. There is no QNX toolchain here; nothing native is rebuilt in this repository.
 
 ## Install mechanics (modkit/)
 
@@ -29,10 +29,16 @@ Hard-won facts about the unit the scripts must survive (an e-tron on P2873, see 
 
 ```bash
 # Rebuild the Audi SD package from the Porsche release zip (overlays modkit/Mods,
-# derives aa_only/<name>_aa.jar = release JAR minus the carplay package)
+# derives aa_only/<name>_aa.jar = release JAR minus the carplay package, then
+# runs build_aa_jar.sh to put this fork's classes in; needs the unit's stock
+# classes at ~/etron-stock/lsd (or STOCK_CLASSES=) and ECJ (ECJ_JAR=))
 modkit/build_sd_package.sh builds/ClusterIntegration_v0034_beta2_candidate_90d0b76.zip \
                            builds/ClusterIntegration_v0034_beta2_candidate_90d0b76_audi.zip
 # (the build also refreshes the tracked modkit/Mods/.../aa_only/*_aa.jar)
+
+# Recompile only this fork's Java (AndroidAuto2Subsystem, nav/KombiMapHandback)
+# into the tracked aa_only jar; checks class-file version 48 and no StringBuilder
+modkit/build_aa_jar.sh [~/etron-stock/lsd] [~/.cache/ecj-3.20.0.jar]
 
 # Rebuild the StorageMountHandler stand-in (JDK required) and its jar under Update/audi/
 modkit/stub/build_stub.sh
@@ -65,5 +71,7 @@ The gate scripts assert on the installer's log lines, so a wording change in `in
 
 - Cockpit fit is solved (`codecRes=1080`, `mode=fill`, `panY=0.248`, top inset 358); Google ignores the left/right insets, so its turn card stays flush right, clipped by the housing.
 - BAP manoeuvres are sent (`BAP_MANEUVER`/`BAP_DISTANCE` in `cluster.log`) but the cockpit draws no Audi-style arrow yet.
-- After Android Auto disconnects the cockpit goes black instead of returning to the Audi map, and the steering-wheel zoom only drives the hidden Audi map: the mod cannot find the HMI's cluster map-viewer control (`DSIMapViewerControl` instance 3 / `IMapClusterService`) on the e-tron (no `KOMBI_MAP:` lines). All three need the Audi HMI's navigation and BAP classes (`de/audi/tghu/*`, `org/dsi/ifc/map/*`, `de/audi/atip/interapp/combi/bap/*`, `de/audi/app/terminalmode/*`) extracted from the unit's `lsd.jar`.
+- The unit's stock `lsd.jar` is now available (extracted to `~/etron-stock/lsd/`, outside the repo; 77,288 classes). Findings so far: the stock navigation registers `IMapClusterService` from `de.audi.tghu.navi.app.map.AbstractMapActivator` and reaches it through a `ServiceTracker` by name (`MapClusterServiceProxy`); the shipped cluster integration never calls it at session end (no `wakeNativeNavCluster` in the shipped class), which is why the cockpit went black. `KombiMapHandback` (2026-10-17, untested on the car as of this note) does the hide/show hand-back; if the `KOMBI_MAP: IMapClusterService registered` line never appears, read the `KOMBI_MAP: service:` inventory it logs at session start.
+- Steering-wheel zoom: `MapClusterService.changeZoomLevel(int)` fires `RemoteZoomView.fireOnZoomLevelChanged`, i.e. the cockpit's zoom reaches the HMI through the cluster BAP listener (`de/audi/tghu/navi/app/cluster/CombiBAPListener`, `NaviClusterExtensionFPKRevo$ZoomViewListener`); routing it to the phone map is not started.
+- BAP manoeuvre arrow: the Audi serializers are under `de/vw/mib/bap/generated/navigationsd/` (`ManeuverDescriptor_Maneuver_3`, `DistanceToNextManeuver_Status`); not yet compared with what `CombiBAPServiceNavi` sends.
 - LawPaul's `NavCompassIgnore` ModKit mod (separate `Mods/` folder on the same card) stops the cockpit switching to its compass when navigation starts; its classes do not overlap with this mod's.

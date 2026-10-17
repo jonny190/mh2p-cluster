@@ -129,6 +129,18 @@ for name in sorted(os.listdir(upd)):
     print(f"  derive:  Mods/ClusterIntegration/Update/aa_only/{os.path.basename(dst)} ({kept} entries kept, {dropped} CarPlay entries dropped)")
 PY
 
+# The derived jar holds the release classes only. This fork changes
+# AndroidAuto2Subsystem and adds nav/KombiMapHandback (the cluster map
+# hand-back after Android Auto ends); build_aa_jar.sh compiles them for the
+# HMI's Java 1.4 JVM and replaces them in the jar. It needs the unit's stock
+# classes and the ECJ jar (see its header); without them the package would
+# silently ship without the hand-back, so this is an error, not a warning.
+for f in "$PKG"/Mods/ClusterIntegration/Update/aa_only/ClusterIntegration_*_aa.jar; do
+    [[ -f "$f" ]] || continue
+    AA_JAR="$f" "$HERE/build_aa_jar.sh" "${STOCK_CLASSES:-$HOME/etron-stock/lsd}" "${ECJ_JAR:-$HOME/.cache/ecj-3.20.0.jar}" \
+        || { echo "error: build_aa_jar.sh failed for ${f##*/}; set STOCK_CLASSES / ECJ_JAR (see modkit/build_aa_jar.sh)" >&2; exit 1; }
+done
+
 # Keep the tracked copy of the derived Audi jar in step with the package, so
 # the overlay in this repository ships the same bytes the build produced.
 for f in "$PKG"/Mods/ClusterIntegration/Update/aa_only/ClusterIntegration_*_aa.jar; do
