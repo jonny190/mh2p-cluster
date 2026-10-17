@@ -26,6 +26,7 @@
 MEDIA="${0%/*}"
 [[ "$MEDIA" == "$0" ]] && MEDIA="."
 export MOD_PATH="$MEDIA/Mods/ClusterIntegration/Update"
+unset modPath
 mkdir -p "$MEDIA/Logs" 2>/dev/null
 LOG="$MEDIA/Logs/ClusterIntegration-failsafe.log"
 
@@ -35,6 +36,7 @@ if [[ ! -f "$MOD_PATH/uninstall.sh" ]]; then
 fi
 # (echo, not print: ksh's print would parse the leading dashes as options)
 echo "----- failsafe rollback $(date) -----" >> "$LOG"
+echo "entry pid=$$ parent=${PPID:-unknown} media=$MEDIA arguments=$#" >> "$LOG"
 /bin/ksh "$MOD_PATH/uninstall.sh" >> "$LOG" 2>&1
 rc=$?
 echo "----- failsafe done rc=$rc -----" >> "$LOG"

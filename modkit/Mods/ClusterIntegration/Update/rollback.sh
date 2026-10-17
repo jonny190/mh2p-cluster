@@ -25,4 +25,5 @@
 HERE="${0%/*}"
 [[ "$HERE" == "$0" ]] && HERE="."
 export MOD_PATH="$(cd "$HERE" && pwd)"
-exec /bin/ksh "$MOD_PATH/uninstall.sh"
+unset modPath
+exec /bin/ksh "$MOD_PATH/uninstall.sh" "$@"

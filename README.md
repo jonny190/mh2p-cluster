@@ -1,5 +1,9 @@
 # Android Auto and CarPlay Cluster Integration
 
+> **Local Audi P2873 port:** disconnect/reconnect changes and verification limits
+> are in [MIB2P_PORT.md](MIB2P_PORT.md). The archives in `builds/` are upstream
+> releases and do not contain these source changes.
+
 Bridge Android Auto navigation from Porsche PCM5 / ~~VW / Audi~~ MH2P to instrument cluster displays.
 
 > **Donate to charity** https://www.justgiving.com/

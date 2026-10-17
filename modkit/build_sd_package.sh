@@ -24,6 +24,9 @@
 #       builds/ClusterIntegration_v0034_beta2_candidate_90d0b76_audi.zip
 #
 # Requires: bash, python3, zip. Runs on Linux/macOS/WSL (not on the head unit).
+# For the private P2873 diagnostic card with saved stock GAL, checksums and
+# verbose recovery instructions, use build_audi_sd.py instead. Neither
+# packager builds or includes the locally changed lifecycle/native sources.
 
 set -euo pipefail
 

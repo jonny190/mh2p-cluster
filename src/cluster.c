@@ -54,6 +54,14 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <time.h>
+#include "cluster_player_generation.h"
+
+#ifdef MIB2P_BUILD_FINGERPRINT
+#if !defined(__QNXNTO__) || !defined(__arm__)
+#error Vehicle artifacts require the QNX ARM compiler
+#endif
+const char mib2p_player_build_id[] = "MIB2P_PORT_V1:" MIB2P_BUILD_FINGERPRINT;
+#endif
 
 /* SCREEN_FORMAT_YV12 — used in h264 mode for the decode window */
 #define SCREEN_FORMAT_YV12  13
@@ -384,6 +392,9 @@ static pid_t daemon_start_mirror(const char *self, const char *cmdline) {
 
     pid_t pid = fork();
     if (pid == 0) {
+        sigset_t block;
+        sigemptyset(&block); sigaddset(&block, SIGUSR1); sigaddset(&block, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &block, NULL); /* survive resume before exec/handler setup */
         execv(self, targv);
         fprintf(stderr, "[daemon] execv failed errno=%d\n", errno);
         exit(1);
@@ -391,236 +402,9 @@ static pid_t daemon_start_mirror(const char *self, const char *cmdline) {
     return pid;
 }
 
-/* Daemon is a dumb command dispatcher. Java owns lifecycle state.
- *
- * Command set:
- *   prepare [args] — kill any child, spawn fresh with `prepare` arg appended
- *   start   [args] — kill any child, spawn fresh
- *   resume         — SIGUSR1 to child (no-op if no child). Promotes h264
- *                    PREPARE→RENDERING or PAUSED→RENDERING. No spawn.
- *   pause          — SIGUSR2 to child (no-op if no child). h264 child handles
- *                    it as RENDERING→PAUSED; mirror child has no handler so
- *                    kernel kills it (mirror has no useful warm state).
- *   stop           — SIGTERM child.
- *
- * Daemon does NOT track prepared vs rendering vs paused state — those live in
- * the Java integration. Daemon just executes what Java tells it. */
-
-static int daemon_run(int argc, char **argv) {
-    int i;
-    int poll_ms = (int)(get_arg_f(argc, argv, "poll", 2.0f) * 1000);
-
-    /* default mirror args: everything after "daemon", excluding daemon control args.
-     * No xres/yres injection — each child runs its own detect_disp_size in
-     * main(), same as direct invocation, which is the path empirically known
-     * to work with the displaymanager. */
-    char default_args[512] = "";
-    for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "daemon") == 0) continue;
-        if (strncmp(argv[i], "poll=", 5) == 0) continue;
-        if (strlen(default_args) > 0) strncat(default_args, " ", sizeof(default_args) - strlen(default_args) - 1);
-        strncat(default_args, argv[i], sizeof(default_args) - strlen(default_args) - 1);
-    }
-
-    /* create empty control file (0666 so Java can write to it) */
-    FILE *init = fopen(DAEMON_CTL, "w");
-    if (!init) {
-        fprintf(stderr, "[daemon] cannot create %s errno=%d\n", DAEMON_CTL, errno);
-        return 1;
-    }
-    fclose(init);
-    chmod(DAEMON_CTL, 0666);
-
-    printf("[daemon] polling %s every %dms\n", DAEMON_CTL, poll_ms);
-    printf("[daemon] default args: '%s'\n", default_args);
-    printf("[daemon] commands: prepare [args]  start [args]  resume [args]  pause  stop\n");
-
-    pid_t       child_pid = -1;
-    pid_t       splash_pid = -1;  /* idle_logo child holding disp 33 when no real child runs */
-    int         boot_splash_shown = 0;  /* once per daemon lifetime (per boot) */
-    const char *self      = argv[0];
-
-    /* Daemon comes up silent: native maps owns disp 33 by default.
-     * Splash (canim) only spawns on pause/stop commands from Java; fifthBro
-     * is shown for 2s on the first 'prepare' or 'start' command per daemon
-     * lifetime (CarPlay or AA session start), then never again until reboot. */
-
-    while (1) {
-        usleep(poll_ms * 1000);
-
-        /* reap child if it exited on its own */
-        if (child_pid > 0) {
-            int status;
-            if (waitpid(child_pid, &status, WNOHANG) == child_pid) {
-                printf("[daemon] child exited on its own (status=%d)\n", WEXITSTATUS(status));
-                child_pid = -1;
-            }
-        }
-
-        /* reap splash if it exited */
-        if (splash_pid > 0) {
-            int status;
-            if (waitpid(splash_pid, &status, WNOHANG) == splash_pid) {
-                splash_pid = -1;
-            }
-        }
-
-        /* read control file */
-        FILE *f = fopen(DAEMON_CTL, "r");
-        if (!f) continue;
-        char line[512];
-        int got = (fgets(line, sizeof(line), f) != NULL);
-        fclose(f);
-
-        if (!got) continue;
-
-        /* strip trailing whitespace */
-        char *end = line + strlen(line) - 1;
-        while (end >= line && (*end == '\n' || *end == '\r' || *end == ' ')) *end-- = '\0';
-        if (strlen(line) == 0) continue;
-
-        /* truncate the file so we don't re-process the same command */
-        FILE *clr = fopen(DAEMON_CTL, "w");
-        if (clr) fclose(clr);
-
-        printf("[daemon] cmd: '%s' (pid=%d)\n", line, (int)child_pid);
-
-        /* ── STOP: SIGTERM child, then spawn canim splash. Only spawn canim
-         *           if there was actually a child to stop — otherwise we'd
-         *           steal disp 33 from native at boot when no session ever
-         *           ran. */
-        if (strncmp(line, "stop", 4) == 0) {
-            int had_child = (child_pid > 0);
-            if (had_child) {
-                printf("[daemon] stop: SIGTERM pid=%d\n", (int)child_pid);
-                kill(child_pid, SIGTERM);
-                waitpid(child_pid, NULL, 0);
-                child_pid = -1;
-            } else {
-                printf("[daemon] stop: no child (canim suppressed)\n");
-            }
-            if (had_child && splash_pid <= 0) {
-                splash_pid = daemon_start_mirror(self, "capture=canim_splash");
-                printf("[daemon] stop: canim_splash spawned pid=%d\n", (int)splash_pid);
-            }
-
-        /* ── PAUSE: SIGUSR2 to h264 child. NO canim_splash spawn —
-         *           the h264 child paints canim itself in STAGE_PAUSED so
-         *           disp 33 stays bound to the h264 post_win throughout.
-         *           Spawning a second window here would steal the
-         *           displaymanager binding and prevent recovery on resume. */
-        } else if (strncmp(line, "pause", 5) == 0) {
-            if (child_pid > 0) {
-                printf("[daemon] pause: SIGUSR2 pid=%d\n", (int)child_pid);
-                kill(child_pid, SIGUSR2);
-            } else {
-                printf("[daemon] pause: no child\n");
-            }
-
-        /* ── RESUME: SIGUSR1 (h264 PREPARE/PAUSED → RENDERING) ─────── */
-        } else if (strncmp(line, "resume", 6) == 0) {
-            /* Kill splash first so it releases disp 33 before h264 child
-             * window becomes visible again. */
-            if (splash_pid > 0) {
-                kill(splash_pid, SIGTERM);
-                waitpid(splash_pid, NULL, 0);
-                splash_pid = -1;
-            }
-            if (child_pid > 0) {
-                printf("[daemon] resume: SIGUSR1 pid=%d\n", (int)child_pid);
-                kill(child_pid, SIGUSR1);
-            } else {
-                printf("[daemon] resume: no child\n");
-            }
-
-        /* ── PREPARE: kill any child, spawn with `prepare` arg ─────── */
-        } else if (strncmp(line, "prepare", 7) == 0) {
-            const char *extra = line + 7;
-            while (*extra == ' ') extra++;
-            char cmdline[512];
-            /* Merge daemon's default_args with command's extra args so
-             * daemon-level flags (e.g. verbose=2) flow into every child.
-             * cluster.c arg parsing is last-wins, so extra overrides
-             * default_args on conflicts. */
-            /* If the per-boot splash has already been shown (e.g. previous
-             * AA session this boot, or earlier mirror session), pass
-             * skip_boot_splash=1 so the new h264 child won't re-fire it. */
-            const char *skip_arg = boot_splash_shown ? " skip_boot_splash=1" : "";
-            int n;
-            if (*extra && *default_args)
-                n = snprintf(cmdline, sizeof(cmdline), "%s %s%s prepare", default_args, extra, skip_arg);
-            else if (*extra)
-                n = snprintf(cmdline, sizeof(cmdline), "%s%s prepare", extra, skip_arg);
-            else
-                n = snprintf(cmdline, sizeof(cmdline), "%s%s prepare", default_args, skip_arg);
-            if (n < 0 || n >= (int)sizeof(cmdline)) cmdline[sizeof(cmdline)-1] = '\0';
-
-            /* No boot_splash on prepare — h264 child paints its own fifthBro
-             * on first resume via the in-child splash path (apply_stage_signals).
-             * Spawning boot_splash here would override disp 33 too early. */
-
-            if (child_pid > 0) {
-                kill(child_pid, SIGTERM);
-                waitpid(child_pid, NULL, 0);
-                child_pid = -1;
-            }
-            /* Do NOT kill canim_splash here. h264 child spawns in PREPARE
-             * with post_win VISIBLE=0 — it doesn't claim disp 33 until
-             * resume. Leaving canim_splash alive across PREPARE keeps the
-             * Porsche image on screen during the gap between phone reconnect
-             * and user focus, instead of going BLACK. Resume kills it. The
-             * earlier in-child-splash binding race that broke first focus
-             * here is suppressed on reconnect via skip_boot_splash=1. */
-            child_pid = daemon_start_mirror(self, cmdline);
-            /* Mark per-boot splash as consumed so future prepares (e.g. after
-             * disconnect+reconnect) don't replay it. */
-            boot_splash_shown = 1;
-            printf("[daemon] prepare: pid=%d args='%s'\n", (int)child_pid, cmdline);
-
-        /* ── START: kill any child, spawn fresh ────────────────────── */
-        } else if (strncmp(line, "start", 5) == 0) {
-            const char *extra = line + 5;
-            while (*extra == ' ') extra++;
-            char cmdline[512];
-            /* Same merge as prepare: default_args + extra so daemon flags
-             * (verbose etc) reach every spawned child. */
-            int n;
-            if (*extra && *default_args)
-                n = snprintf(cmdline, sizeof(cmdline), "%s %s", default_args, extra);
-            else if (*extra)
-                n = snprintf(cmdline, sizeof(cmdline), "%s", extra);
-            else
-                n = snprintf(cmdline, sizeof(cmdline), "%s", default_args);
-            if (n < 0 || n >= (int)sizeof(cmdline)) cmdline[sizeof(cmdline)-1] = '\0';
-
-            if (!boot_splash_shown) {
-                pid_t bp = daemon_start_mirror(self, "capture=boot_splash duration_s=2");
-                printf("[daemon] boot_splash: pid=%d, waiting 2s before start\n", (int)bp);
-                if (bp > 0) waitpid(bp, NULL, 0);
-                boot_splash_shown = 1;
-            }
-
-            if (child_pid > 0) {
-                kill(child_pid, SIGTERM);
-                waitpid(child_pid, NULL, 0);
-                child_pid = -1;
-            }
-            /* Release disp 33 from the idle splash before spawning. */
-            if (splash_pid > 0) {
-                kill(splash_pid, SIGTERM);
-                waitpid(splash_pid, NULL, 0);
-                splash_pid = -1;
-            }
-            child_pid = daemon_start_mirror(self, cmdline);
-            printf("[daemon] start: pid=%d args='%s'\n", (int)child_pid, cmdline);
-
-        } else {
-            printf("[daemon] unknown command '%s' (use: prepare/start [args] / resume / pause / stop)\n", line);
-        }
-    }
-
-    return 0;
-}
+/* Versioned AA-only lifecycle dispatcher. Legacy cluster_ctl is deliberately
+ * not consumed: two writers must not race for displayable 33. */
+#include "cluster_lifecycle_daemon.h"
 
 /* parse "key=value" args */
 static float get_arg_f(int argc, char **argv, const char *key, float def) {
@@ -1935,7 +1719,7 @@ static int setup_screen(int width, int height) {
         int br = screen_blit(g_dec.scr_ctx, g_dec.post_bufs[pidx],
                              g_dec.boot_pix_buf, ba);
         int dirty[4] = { 0, 0, width, height };
-        screen_post_window(g_dec.post_win, g_dec.post_bufs[pidx], 1, dirty, 0);
+        m2_player_post(g_dec.post_win, g_dec.post_bufs[pidx], 1, dirty, 0);
         screen_flush_context(g_dec.scr_ctx, 0);
         g_boot_splash_until_ms         = now_us() / 1000ULL + 2000ULL;
         g_boot_splash_shown_in_session = 1;
@@ -2148,7 +1932,7 @@ static void apply_stage_signals(void) {
             int br = screen_blit(g_dec.scr_ctx, g_dec.post_bufs[pidx],
                                  g_dec.boot_pix_buf, ba);
             int dirty[4] = { 0, 0, g_dec.width, g_dec.height };
-            screen_post_window(g_dec.post_win, g_dec.post_bufs[pidx],
+            m2_player_post(g_dec.post_win, g_dec.post_bufs[pidx],
                                1, dirty, 0);
             screen_flush_context(g_dec.scr_ctx, 0);
             g_boot_splash_until_ms         = now_us() / 1000ULL + 2000ULL;
@@ -2170,7 +1954,7 @@ static void apply_stage_signals(void) {
             int br = screen_blit(g_dec.scr_ctx, g_dec.post_bufs[pidx],
                                  g_dec.canim_pix_buf, blit_attribs);
             int dirty[4] = { 0, 0, g_dec.width, g_dec.height };
-            screen_post_window(g_dec.post_win, g_dec.post_bufs[pidx],
+            m2_player_post(g_dec.post_win, g_dec.post_bufs[pidx],
                                1, dirty, 0);
             screen_flush_context(g_dec.scr_ctx, 0);
             LOG("h264: pause → PAUSED, canim blit rc=%d posted to pidx=%d "
@@ -2194,7 +1978,7 @@ static void apply_stage_signals(void) {
         int idx = (g_dec.post_buf_idx == 0)
                       ? (MAX_SURFACES - 1) : (g_dec.post_buf_idx - 1);
         int dirty[4] = { 0, 0, g_dec.width, g_dec.height };
-        screen_post_window(g_dec.post_win, g_dec.post_bufs[idx], 1, dirty, 0);
+        m2_player_post(g_dec.post_win, g_dec.post_bufs[idx], 1, dirty, 0);
         screen_flush_context(g_dec.scr_ctx, 0);
         g_boot_splash_post_done = 1;
         g_last_posted_pidx      = idx;
@@ -2210,7 +1994,7 @@ static void apply_stage_signals(void) {
         uint64_t now_ms = now_us() / 1000ULL;
         if (now_ms - g_last_post_ms > 50) {
             int dirty[4] = { 0, 0, g_dec.width, g_dec.height };
-            screen_post_window(g_dec.post_win,
+            m2_player_post(g_dec.post_win,
                                g_dec.post_bufs[g_last_posted_pidx],
                                1, dirty, 0);
             screen_flush_context(g_dec.scr_ctx, 0);
@@ -2367,7 +2151,7 @@ static int cb_display_picture(void* user, void* disp_info) {
      * re-posts the splash buffer every ~50ms during the window. */
     if (g_render_stage == STAGE_RENDERING &&
         (now_us() / 1000ULL) >= g_boot_splash_until_ms) {
-        screen_post_window(g_dec.post_win, g_dec.post_bufs[pidx], 1, dirty, 0);
+        m2_player_post(g_dec.post_win, g_dec.post_bufs[pidx], 1, dirty, 0);
         screen_flush_context(g_dec.scr_ctx, 0);
         g_last_posted_pidx = pidx;
         g_last_post_ms     = now_us() / 1000ULL;
@@ -2513,6 +2297,7 @@ static uint64_t now_us(void) {
  * display and h264 modes — same arg names + defaults across modes). */
 
 int run_h264_mode(int argc, char** argv) {
+    pid_t lifecycle_parent = (pid_t)strtol(get_arg_s(argc, argv, "lifecycle_parent", "0"), NULL, 10);
     int dump_mode = (argc > 1 && strcmp(argv[1], "dump") == 0);
 
     /* Daemon two-stage support: bare `prepare` arg starts the process in
@@ -2540,6 +2325,11 @@ int run_h264_mode(int argc, char** argv) {
         }
         signal(SIGUSR1, on_sigusr1);
         signal(SIGUSR2, on_sigusr2);
+        {
+            sigset_t unblock;
+            sigemptyset(&unblock); sigaddset(&unblock, SIGUSR1); sigaddset(&unblock, SIGUSR2);
+            sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+        }
         LOG("h264 stage=%s (SIGUSR1=resume SIGUSR2=pause SIGTERM=exit)\n",
             prepare_mode ? "PREPARE" : "RENDERING");
     }
@@ -2562,44 +2352,39 @@ int run_h264_mode(int argc, char** argv) {
         g_h264_args.mode, g_h264_args.zoomX, g_h264_args.zoomY,
         g_h264_args.panX, g_h264_args.panY, g_h264_args.xres, g_h264_args.yres);
 
-    /* Open SHM */
-    LOG("waiting for SHM %s...\n", CLUSTER_SHM_NAME);
-    int sfd = -1;
-    while (sfd < 0) { sfd = shm_open(CLUSTER_SHM_NAME, O_RDONLY, 0); usleep(500000); }
-    cluster_h264_shm_t* shm = (cluster_h264_shm_t*)mmap(NULL, sizeof(*shm),
-        PROT_READ, MAP_SHARED, sfd, 0);
-    close(sfd);
-    if (shm == MAP_FAILED) { perror("mmap"); return 1; }
-
-    while (shm->magic != CLUSTER_SHM_MAGIC) usleep(100000);
-    LOG("SHM active\n");
-
-    /* Dump mode */
-    if (dump_mode) {
-        int out_fd = open("/tmp/cluster_from_shm.h264", O_WRONLY|O_CREAT|O_TRUNC, 0644);
-        uint32_t read_pos = shm->write_pos;
-        uint32_t last_total = shm->total_bytes;
-        int dump_bytes = 0;
-        uint64_t t0 = now_us();
-        LOG("dumping...\n");
-        while (dump_bytes < 4*1024*1024) {
-            uint32_t total = shm->total_bytes;
-            if (total == last_total) { usleep(1000); if (dump_bytes>0 && now_us()-t0>10000000ULL) break; continue; }
-            t0 = now_us();
-            uint32_t wp = shm->write_pos;
-            uint32_t avail = (wp >= read_pos) ? wp-read_pos : CLUSTER_RING_SIZE-read_pos+wp;
-            if (avail > 0 && out_fd >= 0) {
-                if (read_pos+avail <= CLUSTER_RING_SIZE) { write(out_fd, shm->ring+read_pos, avail); }
-                else { uint32_t f=CLUSTER_RING_SIZE-read_pos; write(out_fd,shm->ring+read_pos,f); write(out_fd,shm->ring,avail-f); }
-                read_pos = (read_pos+avail) % CLUSTER_RING_SIZE;
-                dump_bytes += avail;
+    /* Require an exact v2 mapping and claim one immutable native connection. */
+    signal(SIGTERM,m2_player_signal); signal(SIGINT,m2_player_signal);
+    uint64_t connect_deadline=now_us()+5000000ULL;
+    cluster_h264_shm_t *shm=NULL;
+    while(!g_m2_player_quit && now_us()<connect_deadline) {
+        int fd=shm_open(CLUSTER_SHM_NAME,O_RDWR,0); struct stat st;
+        if(lifecycle_parent>0 && getppid()!=lifecycle_parent) return 1;
+        if(fd>=0) {
+            if(!fstat(fd,&st) && st.st_size==(off_t)sizeof(*shm))
+                shm=(cluster_h264_shm_t*)mmap(NULL,sizeof(*shm),PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+            close(fd);
+            if(shm && shm!=MAP_FAILED && m2_valid(shm)) {
+                m2_player_reap_reader(shm);
+                if(m2_player_claim(shm)==M2_PACKET) break;
             }
-            last_total = total;
-            if ((dump_bytes%(100*1024))<1000) LOG("  %d KB\n", dump_bytes/1024);
+            if(shm && shm!=MAP_FAILED) munmap(shm,sizeof(*shm)); shm=NULL;
         }
-        close(out_fd);
-        LOG("done: %d bytes\n", dump_bytes);
-        return 0;
+        usleep(10000);
+    }
+    if(!shm || g_m2_player_quit) { LOG("generation: no claimable v2 stream; refusing decode\n"); return 1; }
+    LOG("generation: bound writer=%u receiver=%u stream=%u\n",shm->writer_pid,
+        g_m2_player_reader.stamp.receiver,g_m2_player_reader.stamp.stream);
+    if(dump_mode) {
+        uint8_t *bytes=(uint8_t*)malloc(M2_PACKET_MAX); uint32_t length,flags;
+        int output=open("/tmp/cluster_from_shm.h264",O_WRONLY|O_CREAT|O_TRUNC,0644);
+        uint32_t dumped=0; uint64_t timeout=now_us()+10000000ULL;
+        if(bytes && output>=0) while(!g_m2_player_quit && dumped<4*1024*1024 && now_us()<timeout) {
+            int result=m2_read(shm,&g_m2_player_reader,bytes,M2_PACKET_MAX,&length,&flags);
+            if(result<0 || !m2_player_public_matches()) break;
+            if(result==M2_PACKET) { write(output,bytes,length); dumped+=length; }
+            else usleep(1000);
+        }
+        if(output>=0) close(output); free(bytes); m2_release(shm,&g_m2_player_reader); return 0;
     }
 
     /* ---- Decode mode ---- */
@@ -2664,52 +2449,36 @@ int run_h264_mode(int argc, char** argv) {
         }
     }
 
-    /* Main decode loop: read from SHM, feed to parser. Start from CURRENT
-     * write position so we get fresh data with valid NAL boundaries. */
-    uint32_t read_pos = shm->write_pos;
-    uint32_t last_total = shm->total_bytes;
-    int feed_count = 0;
-    uint64_t t0 = now_us();
-    (void)t0;
-
-    LOG("decode loop started (wp=%u total=%u, waiting for NEW H.264 data)...\n",
-        read_pos, last_total);
-
-    while (1) {
-        /* Apply pause/resume signals here too — when AA is paused, the phone
-         * stops sending H.264 frames, so the decoder's cb_display_picture
-         * stops firing and pause handling stuck inside that callback would
-         * never run. Polling here ensures canim still gets painted on pause
-         * even with no new frames in flight. */
+    uint8_t *chunk=(uint8_t*)malloc(M2_PACKET_MAX);
+    int feed_count=0;
+    uint32_t total=0;
+    uint64_t last_identity_check=0;
+    if(!chunk) return 1;
+    while(!g_m2_player_quit) {
+        uint32_t avail=0, packet_flags=0;
+        int result=m2_matches(shm,&g_m2_player_reader);
+        uint64_t now=now_us();
+        if(result==M2_STALE || (lifecycle_parent>0 && getppid()!=lifecycle_parent)) break;
+        if(now-last_identity_check>=100000ULL) {
+            last_identity_check=now;
+            if(!m2_player_public_matches()) break;
+        }
+        /* Never let a paused/no-frame path adopt a new stream or post old data. */
         apply_stage_signals();
-        uint32_t total = shm->total_bytes;
-        if (total == last_total) {
-            usleep(1000);
-            continue;
+        result=m2_read(shm,&g_m2_player_reader,chunk,M2_PACKET_MAX,&avail,&packet_flags);
+        if(result<0) break;
+        if(result!=M2_PACKET) { usleep(1000); continue; }
+        total+=avail;
+        if(packet_flags&M2_IDR) m2_store(&g_m2_can_post,1);
+        {
+            int attempt;
+            for(attempt=0;attempt<20;++attempt) {
+                result=m2_matches(shm,&g_m2_player_reader);
+                if(result!=M2_BUSY) break;
+                usleep(100);
+            }
+            if(result!=M2_PACKET) break; /* never discard a consumed codec/reference packet then keep decoding */
         }
-
-        uint32_t wp = shm->write_pos;
-        uint32_t avail;
-        if (wp >= read_pos)
-            avail = wp - read_pos;
-        else
-            avail = CLUSTER_RING_SIZE - read_pos + wp;
-
-        if (avail == 0) { last_total = total; continue; }
-
-        /* Read into contiguous buffer */
-        uint8_t* chunk = (uint8_t*)malloc(avail);
-        if (!chunk) { last_total = total; continue; }
-
-        if (read_pos + avail <= CLUSTER_RING_SIZE) {
-            memcpy(chunk, shm->ring + read_pos, avail);
-        } else {
-            uint32_t first = CLUSTER_RING_SIZE - read_pos;
-            memcpy(chunk, shm->ring + read_pos, first);
-            memcpy(chunk + first, shm->ring, avail - first);
-        }
-        read_pos = (read_pos + avail) % CLUSTER_RING_SIZE;
-        last_total = total;
 
         /* Feed directly to parser — it handles NAL discovery internally.
          * Log first chunks and any NAL start codes we see for diagnostics. */
@@ -2782,16 +2551,17 @@ int run_h264_mode(int argc, char** argv) {
                         "producer=%.1fkbps decode_fps=%.1f display_fps=%.1f%s\n",
                         pr, g_dec.frames_decoded, g_dec.frames_displayed, feed_count, avail,
                         prod_kbps, dec_fps, disp_fps,
-                        avail > (CLUSTER_RING_SIZE * 3 / 4) ? " RING_NEAR_FULL!" : "");
+                        "");
                     last_t = now; last_bytes = total;
                     last_dec = g_dec.frames_decoded; last_disp = g_dec.frames_displayed;
                 }
             }
             if (g_dec.frames_decoded >= next_log_frames) next_log_frames += 250;
         }
-        free(chunk);
     }
-
+    m2_store(&g_m2_can_post,0);
+    LOG("generation: stream retired/lost; decoder process exiting without rebinding\n");
+    free(chunk); (void)m2_release(shm,&g_m2_player_reader);
     return 0;
 }
 

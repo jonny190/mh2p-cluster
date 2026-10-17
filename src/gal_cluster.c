@@ -87,6 +87,13 @@
 #include <screen/screen.h>
 #include "cluster_h264_shm.h"
 
+#ifdef MIB2P_BUILD_FINGERPRINT
+#if !defined(__QNXNTO__) || !defined(__arm__)
+#error Vehicle artifacts require the QNX ARM compiler
+#endif
+const char mib2p_gal_build_id[] = "MIB2P_PORT_V1:" MIB2P_BUILD_FINGERPRINT;
+#endif
+
 #define LOG_PATH "/tmp/gal_cluster.log"
 #define DUMP_DIR "/tmp"
 #define MAX_SERIALIZE_BYTES (2 * 1024 * 1024)
@@ -953,7 +960,8 @@ static int cl_setup_screen(int w, int h) {
     return 0;
 }
 
-static void* g_router_ptr = NULL;  /* captured MessageRouter* */
+static void* g_router_ptr = NULL;  /* live owned router; legacy in-hook decoder disabled */
+#include "cluster_receiver_adapter.h"
 
 static void* cl_find_gal_device(void) {
     /* Traverse: router → endpoint[svc1] → renderer → device
@@ -2332,28 +2340,22 @@ static void hook_init(void) {
         }
     }
 
-    /* Initialize cluster H.264 SHM ring buffer */
-    {
-        int sfd = shm_open(CLUSTER_SHM_NAME, O_RDWR | O_CREAT, 0666);
-        if (sfd >= 0) {
-            ftruncate(sfd, sizeof(cluster_h264_shm_t));
-            g_cluster_shm = (cluster_h264_shm_t*)mmap(NULL, sizeof(cluster_h264_shm_t),
-                PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
-            close(sfd);
-            if (g_cluster_shm == MAP_FAILED) {
-                g_cluster_shm = NULL;
-                log_line("[gal_cluster] cluster SHM: mmap failed\n");
-            } else {
-                g_cluster_shm->magic = CLUSTER_SHM_MAGIC;
-                g_cluster_shm->write_pos = 0;
-                g_cluster_shm->total_bytes = 0;
-                g_cluster_shm->flags = 1;
-                log_line("[gal_cluster] cluster SHM: ready (%zu bytes)\n", sizeof(cluster_h264_shm_t));
-            }
-        } else {
-            log_line("[gal_cluster] cluster SHM: shm_open failed errno=%d\n", errno);
+    /* New ring is opt-in; an old packaged helper cannot consume this ABI. */
+    g_m2_enabled=get_env_u32("GAL_CLUSTER_LIFECYCLE",0)==1;
+    g_cluster_enabled=g_m2_enabled && get_env_u32("GAL_CLUSTER_MERGE",1);
+    if(g_m2_enabled) {
+        pthread_mutexattr_t attr;
+        int ok=!pthread_mutexattr_init(&attr);
+        if(ok) {
+            ok=!pthread_mutexattr_settype(&attr,PTHREAD_MUTEX_RECURSIVE) && !pthread_mutex_init(&g_m2_mutex,&attr);
+            pthread_mutexattr_destroy(&attr);
         }
+        g_m2_mutex_ready=ok;
+        if(!ok || !m2_create_mapping()) { g_m2_enabled=0; g_cluster_enabled=0; }
     }
+    g_cl.decode_in_hook=0; g_fake_main_projected=0; g_keepalive_ms=0;
+    g_restart_on_return=0; g_stopstart_on_return=0;
+    log_line("[generation] lifecycle=%d; background send/in-hook decode disabled\n",g_m2_enabled);
 
     /* Resolve NvMedia symbols (stored in g_nv for potential future use) */
     {
@@ -2491,7 +2493,7 @@ void _ZN24NavigationStatusEndpoint16addDiscoveryInfoEP24ServiceDiscoveryResponse
  * Calls real function first, then rewrites the serialized protobuf
  * to force NavigationStatusService type=2 + ImageOptions.
  */
-void _ZN13MessageRouter32populateServiceDiscoveryResponseEP24ServiceDiscoveryResponse(
+static void m2_populate_locked(
     void* self, void* resp)
 {
     resolve_symbols();
@@ -2521,7 +2523,7 @@ void _ZN13MessageRouter32populateServiceDiscoveryResponseEP24ServiceDiscoveryRes
     }
 
     if (g_cluster_enabled < 0)
-        g_cluster_enabled = (int)get_env_u32("GAL_CLUSTER_MERGE", 1);
+        g_cluster_enabled = g_m2_enabled && (int)get_env_u32("GAL_CLUSTER_MERGE", 1);
 
     /* Build the COMPLETE modified SD response wire bytes.
      * We serialize the original, inject display_type=MAIN into existing video service,
@@ -2601,6 +2603,20 @@ void _ZN13MessageRouter32populateServiceDiscoveryResponseEP24ServiceDiscoveryRes
     free(buf);
 }
 
+void _ZN13MessageRouter32populateServiceDiscoveryResponseEP24ServiceDiscoveryResponse(void *self,void *resp) {
+    resolve_symbols();
+    if(!g_m2_enabled) { if(real_populate_sd) real_populate_sd(self,resp); return; }
+    pthread_mutex_lock(&g_m2_mutex);
+    if(m2_for_router(self)) {
+        free(g_original_sdresp); free(g_modified_sdresp);
+        g_original_sdresp=g_modified_sdresp=NULL;
+        g_original_sdresp_len=g_modified_sdresp_len=0;
+        m2_populate_locked(self,resp);
+    }
+    else if(real_populate_sd) real_populate_sd(self,resp);
+    pthread_mutex_unlock(&g_m2_mutex);
+}
+
 /*
  * MessageRouter::queueOutgoing hook — THE KEY HOOK for cluster display injection.
  *
@@ -2613,23 +2629,23 @@ void _ZN13MessageRouter32populateServiceDiscoveryResponseEP24ServiceDiscoveryRes
  *
  * No protobuf object modification. No ByteSizeLong patching. No crashes.
  */
-static void (*real_queue_outgoing)(void* self, uint8_t ch, void* data, uint32_t len) = NULL;
+static int32_t (*real_queue_outgoing)(void* self, uint8_t ch, void* data, uint32_t len) = NULL;
 
 /* Real MessageRouter::routeMessage(uchar channel, shared_ptr<IoBuffer> const&) —
  * the central incoming dispatcher in libautoreceiver. Hooked below so we can
  * see what phone is sending us on each channel during HMI transitions. */
-static void (*real_routeMessage)(void* self, uint8_t channel, void* shared_ptr_ref) = NULL;
+static int32_t (*real_routeMessage)(void* self, uint8_t channel, void* shared_ptr_ref) = NULL;
 
 /* Per-endpoint route hooks. Same shape but include msg_type:
  *   void X::routeMessage(uchar channel, ushort msg_type, shared_ptr<IoBuffer> const&)
  * Hooking these gives us channel+type directly, no IoBuffer parsing needed. */
 static void (*real_controller_routeMessage)(void*, uint8_t, uint16_t, void*) = NULL;
-static void (*real_mediasinkbase_routeMessage)(void*, uint8_t, uint16_t, void*) = NULL;
+static int32_t (*real_mediasinkbase_routeMessage)(void*, uint8_t, uint16_t, void*) = NULL;
 
 /* Wrapper around real_queue_outgoing that records the byte count for the
  * rate log. Use this instead of real_queue_outgoing() everywhere so our
  * own injections (mirror, keep-alive, on-open) show up in rate stats. */
-static void hook_queue_outgoing(void* self, uint8_t ch, void* data, uint32_t len);
+static int32_t hook_queue_outgoing(void* self, uint8_t ch, void* data, uint32_t len);
 
 /* Wall-clock ms (monotonic) for rate-log timestamps. */
 static uint64_t now_ms(void) {
@@ -2710,19 +2726,31 @@ static void rate_log_record(uint8_t ch, const void* data, uint32_t len) {
 
 /* Use this instead of real_queue_outgoing() for our own injections so they
  * are counted in the rate log alongside gal0's natural outgoing calls. */
-static void hook_queue_outgoing(void* self, uint8_t ch, void* data, uint32_t len) {
-    rate_log_record(ch, data, len);
-    if (real_queue_outgoing) real_queue_outgoing(self, ch, data, len);
+static int32_t m2_native_send(m2_endpoint *ep,uint8_t *data,uint32_t len) {
+    int32_t result=-5;
+    if(!real_queue_outgoing) real_queue_outgoing=(int32_t(*)(void*,uint8_t,void*,uint32_t))dlsym(RTLD_NEXT,"_ZN13MessageRouter13queueOutgoingEhPvj");
+    if(m2_for_router(ep->owner->router)==ep->owner && m2_endpoint_live(&g_m2_owners,ep,ep->channel) && real_queue_outgoing) {
+        rate_log_record((uint8_t)ep->channel,data,len);
+        result=real_queue_outgoing(ep->owner->router,(uint8_t)ep->channel,data,len);
+    }
+    /* P2873 messageToFrames at0xe8268 copies the bytes synchronously.
+     * This frees OUR allocations only, never stock queueOutgoing arguments. */
+    free(data); return result;
+}
+static int32_t hook_queue_outgoing(void* self,uint8_t service,void* data,uint32_t len) {
+    m2_receiver *o=m2_for_router(self);
+    if(!o || service!=M2_VIDEO_SERVICE) { free(data); return -5; }
+    return m2_native_send(&o->video,(uint8_t*)data,len);
 }
 
-void _ZN13MessageRouter13queueOutgoingEhPvj(void* self, uint8_t ch, void* data, uint32_t len)
+static int32_t m2_queue_locked(void* self, uint8_t ch, void* data, uint32_t len)
 {
     if (!real_queue_outgoing)
-        real_queue_outgoing = (void(*)(void*,uint8_t,void*,uint32_t))
+        real_queue_outgoing = (int32_t(*)(void*,uint8_t,void*,uint32_t))
             dlsym(RTLD_NEXT, "_ZN13MessageRouter13queueOutgoingEhPvj");
 
     if (g_cluster_enabled < 0)
-        g_cluster_enabled = (int)get_env_u32("GAL_CLUSTER_MERGE", 1);
+        g_cluster_enabled = g_m2_enabled && (int)get_env_u32("GAL_CLUSTER_MERGE", 1);
 
     /* Snoop ch=1 0x8008 to track REAL focus state (BEFORE any rewrite),
      * so g_hmi_focus_projected always reflects what gal0 thinks regardless
@@ -2805,7 +2833,7 @@ void _ZN13MessageRouter13queueOutgoingEhPvj(void* self, uint8_t ch, void* data, 
 
         /* Check: msg_type=6 (0x0006) at start, followed by our known SD response */
         if (buf[0] == 0x00 && buf[1] == 0x06 &&
-            len >= 2 + (uint32_t)g_original_sdresp_len &&
+            len == 2 + (uint32_t)g_original_sdresp_len &&
             memcmp(buf + 2, g_original_sdresp, g_original_sdresp_len) == 0)
         {
             /* Build replacement: same msg_type + modified protobuf */
@@ -2819,17 +2847,13 @@ void _ZN13MessageRouter13queueOutgoingEhPvj(void* self, uint8_t ch, void* data, 
                 log_line("[gal_cluster] queueOutgoing: INJECTED cluster! ch=%d orig=%u new=%u\n",
                          (int)ch, len, new_len);
 
-                if (real_queue_outgoing)
-                    real_queue_outgoing(self, ch, new_buf, new_len);
-                /* DON'T free new_buf — queueOutgoing stores the pointer for
-                 * async sending. Freeing here = use-after-free → Malloc Check.
-                 * Leak 535 bytes once per connection — harmless. */
-
+                int32_t injected_result=real_queue_outgoing?real_queue_outgoing(self,ch,new_buf,new_len):-5;
+                free(new_buf); /* audited synchronous stock byte copy */
                 /* Inject only once per connection */
                 free(g_original_sdresp);
                 g_original_sdresp = NULL;
                 g_original_sdresp_len = 0;
-                return;
+                return injected_result;
             }
         }
 
@@ -2845,8 +2869,7 @@ void _ZN13MessageRouter13queueOutgoingEhPvj(void* self, uint8_t ch, void* data, 
     }
 
     /* Forward to real queueOutgoing */
-    if (real_queue_outgoing)
-        real_queue_outgoing(self, ch, data, len);
+    int32_t native_result=real_queue_outgoing?real_queue_outgoing(self,ch,data,len):-5;
 
     /* Cluster ACK is now sent synchronously from dummy_cluster_route so rapid
      * back-to-back cluster messages don't lose their ACKs. Deferred code removed. */
@@ -2866,47 +2889,19 @@ void _ZN13MessageRouter13queueOutgoingEhPvj(void* self, uint8_t ch, void* data, 
         const uint8_t* buf = (const uint8_t*)data;
         uint16_t msg_type = ((uint16_t)buf[0] << 8) | buf[1];
 
-        /* 2026-05-02 NOTE: tried disabling this mirror (run 204922) on
-         * suspicion it was the disconnect cause — confirmed it is LOAD-BEARING.
-         * Without these mirrors the phone never starts the cluster video
-         * stream past the initial mt=0x8000 sync (no codec config, no frames).
-         * 0x8002/0x8003 are setup-phase messages the phone needs to see on
-         * ch=14 to negotiate the cluster stream; 0x8004 may be both setup
-         * and runtime status. Future work: inspect contents to mirror only
-         * the setup-phase ones, not the high-rate status updates.
-         *
-         * 2026-05-02 (run 220501) tried dropping 0x8004 from this mirror set
-         * based on DHU v4 evidence — REGRESSED START: 3/4 sessions in run
-         * 214847 failed to advance past VIDEO_FOCUS, and 0/2 in run 220501.
-         * 0x8004 IS load-bearing in the setup window; mirror restored. */
-        if (msg_type == 0x8002 || msg_type == 0x8004) {
-            /* Mirror 0x8002 (req-ack) and 0x8004 (per-frame MEDIA_START) from
-             * main ch=1 to cluster ch=14. 0x8003 used to be mirrored here too,
-             * but moved to dummy_on_channel_opened to avoid the race where
-             * gal0 sends ch=1 0x8003 before phone opens ch=14 (run 140440 S2). */
-            uint8_t* mirror = (uint8_t*)malloc(len);
-            if (mirror) {
-                memcpy(mirror, data, len);
-                hook_queue_outgoing(self, 14, mirror, len);
-                if (g_cl.debug)
-                    log_line("[gal_cluster] queueOutgoing: mirrored type=0x%04x len=%u to cluster ch=14\n",
-                             msg_type, len);
-            }
-            /* Diagnostic: dump first 30 ch=1 0x8004 payloads so we can see
-             * if the bytes vary per frame (counter? timestamp?) or are
-             * constant. Tells us whether keep-alive must replay variable
-             * content or can use a fixed payload. Gated by GAL_CLUSTER_DEBUG. */
-            if (g_cl.debug && msg_type == 0x8004) {
-                static int s8004_dbg = 0;
-                if (s8004_dbg < 30) {
-                    s8004_dbg++;
-                    char hex[200] = {0}; int o = 0;
-                    int n = (int)len < 32 ? (int)len : 32;
-                    for (int i = 0; i < n; i++)
-                        o += snprintf(hex + o, sizeof(hex) - o, "%02x ", buf[i]);
-                    log_line("[gal_cluster] 0x8004 #%d ch=1 len=%u bytes: %s\n",
-                             s8004_dbg, len, hex);
-                }
+        if(msg_type==0x8002) {
+            uint8_t *mirror=(uint8_t*)malloc(len);
+            if(mirror) { memcpy(mirror,data,len); hook_queue_outgoing(self,14,mirror,len); }
+        } else if(msg_type==0x8004) {
+            /* Upstream observed a startup dependency on 80 04 08 00 10 01.
+             * Preserve that bootstrap pulse until OUR Start is received, but
+             * never copy the main stream's session/count into cluster ACKs.
+             * Runtime ACKs come only from accepted cluster video packets.
+             */
+            m2_receiver *o=m2_for_router(self);
+            if(o && !o->started && m2_load(&g_cluster_shm->live)) {
+                uint8_t *ack=(uint8_t*)malloc(14);
+                if(ack) { uint32_t size=m2_ack_bytes(0,1,ack); m2_native_send(&o->video,ack,size); }
             }
         }
         else if (msg_type == 0x8008) {
@@ -2970,6 +2965,39 @@ void _ZN13MessageRouter13queueOutgoingEhPvj(void* self, uint8_t ch, void* data, 
             }
         }
     }
+    return native_result;
+}
+
+/* All custom sends and retirements share this recursive monitor. No detached
+ * sender retains a global router, and native results/stock buffers are preserved. */
+int32_t _ZN13MessageRouter13queueOutgoingEhPvj(void* self,uint8_t ch,void* data,uint32_t len) {
+    int32_t result;
+    if(!real_queue_outgoing) real_queue_outgoing=(int32_t(*)(void*,uint8_t,void*,uint32_t))dlsym(RTLD_NEXT,"_ZN13MessageRouter13queueOutgoingEhPvj");
+    if(!g_m2_enabled) return real_queue_outgoing?real_queue_outgoing(self,ch,data,len):-5;
+    pthread_mutex_lock(&g_m2_mutex);
+    if(data && len>=2 && m2_for_router(self)) result=m2_queue_locked(self,ch,data,len);
+    else result=real_queue_outgoing?real_queue_outgoing(self,ch,data,len):-5;
+    pthread_mutex_unlock(&g_m2_mutex); return result;
+}
+
+int32_t _ZN13MessageRouter24queueOutgoingUnencryptedEhPvj(void* self,uint8_t channel,void* data,uint32_t length) {
+    static int32_t (*original)(void*,uint8_t,void*,uint32_t)=NULL;
+    int32_t result; uint8_t *replacement=NULL;
+    if(!original) original=(int32_t(*)(void*,uint8_t,void*,uint32_t))dlsym(RTLD_NEXT,"_ZN13MessageRouter24queueOutgoingUnencryptedEhPvj");
+    if(!original) return -5;
+    if(!g_m2_enabled) return original(self,channel,data,length);
+    pthread_mutex_lock(&g_m2_mutex);
+    if(m2_for_router(self) && data && g_original_sdresp && g_modified_sdresp &&
+       length==2+g_original_sdresp_len && ((uint8_t*)data)[0]==0 && ((uint8_t*)data)[1]==6 &&
+       !memcmp((uint8_t*)data+2,g_original_sdresp,g_original_sdresp_len)) {
+        replacement=(uint8_t*)malloc(2+g_modified_sdresp_len);
+        if(replacement) {
+            replacement[0]=0; replacement[1]=6;
+            memcpy(replacement+2,g_modified_sdresp,g_modified_sdresp_len);
+        }
+    }
+    result=original(self,channel,replacement?replacement:data,replacement?(uint32_t)(2+g_modified_sdresp_len):length);
+    free(replacement); pthread_mutex_unlock(&g_m2_mutex); return result;
 }
 
 /*
@@ -3009,406 +3037,26 @@ static void (*real_send_channel_open_resp)(void* self, uint8_t ch, int status) =
 static int (*real_register_channel)(void* chMgr, uint8_t ch, int8_t flag) = NULL;
 static void (*real_setup_mapping)(void* router, uint8_t svc_id, uint8_t ch) = NULL;
 
-/* Fake endpoint for cluster channels — silently consumes H.264 data.
- *
- * routeMessage vtable dispatch:
- *   vtable+0x10 (index 4): onChannelOpened(self, channel) — called by notifyChannelOpened
- *   vtable+0x14 (index 5): routeMessage(self, channel, type, data) — called for each message
- *   vtable+0x0c (index 3): mayOpenChannel(self) — called by handleChannelOpenReq
- */
-static int dummy_may_open(void* self) {
-    log_line("[gal_cluster] cluster endpoint: mayOpenChannel -> yes\n");
-    return 1; /* allow */
-}
-/* Self-driven 0x8004 thread for FAKE_MAIN_PROJECTED mode.
- * When gal0 is silent on ch=1 (HMI is on NATIVE internally), this thread
- * fires the per-frame 0x8004 message on BOTH ch=1 and ch=14 at ~30Hz so
- * phone sees a continuously active main + cluster — matching the focus
- * state rewrite (NATIVE→PROJECTED on ch=1 0x8008). Only active when
- * GAL_CLUSTER_FAKE_MAIN_PROJECTED=1.
- *
- * Payload: byte-identical to gal0's natural and DHU's: 80 04 08 00 10 01. */
-static void* keepalive_thread_fn(void* arg) {
-    (void)arg;
-    int interval_ms = g_fake_main_projected ? FAKE_MAIN_INTERVAL_MS
-                                              : (g_keepalive_ms > 0 ? g_keepalive_ms : FAKE_MAIN_INTERVAL_MS);
-    log_line("[gal_cluster] keepalive thread started, interval=%dms fake_main=%d keepalive_ms=%d\n",
-             interval_ms, g_fake_main_projected, g_keepalive_ms);
-    while (g_keepalive_running) {
-        usleep((useconds_t)interval_ms * 1000);
-        if (!g_keepalive_running) break;
-        if (!real_queue_outgoing || !g_router_ptr) continue;
-
-        /* RESTART_ON_RETURN follow-up: queueOutgoing scheduled the
-         * PROJECTED tick countdown after firing NATIVE. Decrement each
-         * tick; fire when reaches 1, then clear. Gives phone ~500ms in
-         * NATIVE state to actually process it. */
-        if (g_pending_projected_ticks > 0 && g_cluster_ch14_opened) {
-            g_pending_projected_ticks--;
-            if (g_pending_projected_ticks == 0) {
-                uint8_t* prj = (uint8_t*)malloc(6);
-                if (prj) {
-                    prj[0] = 0x80; prj[1] = 0x01;
-                    prj[2] = 0x08; prj[3] = 0x01;  /* PROJECTED */
-                    prj[4] = 0x10; prj[5] = 0x01;
-                    hook_queue_outgoing(g_router_ptr, 14, prj, 6);
-                    log_line("[gal_cluster] restart-on-return: fired 0x8001 PROJECTED follow-up (after delay)\n");
-                }
-            }
-        }
-
-        /* STOPSTART_ON_RETURN follow-up: fire the Start after the Stop has had
-         * time to settle on the phone side. Minimal Start payload — Start has
-         * two required fields per disasm; values zero just satisfy IsInitialized. */
-        if (g_pending_start_ticks > 0 && g_cluster_ch14_opened) {
-            g_pending_start_ticks--;
-            if (g_pending_start_ticks == 0) {
-                uint8_t* st = (uint8_t*)malloc(6);
-                if (st) {
-                    st[0] = 0x80; st[1] = 0x01;
-                    st[2] = 0x08; st[3] = 0x00;  /* Start.field1 (int32) = 0 */
-                    st[4] = 0x10; st[5] = 0x00;  /* Start.field2 (uint32) = 0 */
-                    hook_queue_outgoing(g_router_ptr, 14, st, 6);
-                    log_line("[gal_cluster] stopstart-on-return: fired 0x8001 Start follow-up\n");
-                }
-            }
-        }
-
-        /* Fire only when HMI is internally NATIVE (gal0 silent on ch=1). When
-         * HMI on AA, gal0's mirror handles ch=14 — no need to self-drive. */
-        if (g_hmi_focus_projected) continue;
-        if (!g_cluster_ch14_opened) continue;
-
-        uint8_t bytes[6] = { 0x80, 0x04, 0x08, 0x00, 0x10, 0x01 };
-        /* FAKE_MAIN_PROJECTED: dual-channel self-drive (ch=1 + ch=14).
-         * KEEPALIVE_MS-only:   ch=14 self-drive. */
-        if (g_fake_main_projected) {
-            uint8_t* msg1 = (uint8_t*)malloc(6);
-            if (msg1) {
-                memcpy(msg1, bytes, 6);
-                hook_queue_outgoing(g_router_ptr, 1, msg1, 6);
-            }
-        }
-        uint8_t* msg14 = (uint8_t*)malloc(6);
-        if (msg14) {
-            memcpy(msg14, bytes, 6);
-            hook_queue_outgoing(g_router_ptr, 14, msg14, 6);
-        }
-    }
-    log_line("[gal_cluster] keepalive thread exiting\n");
-    return NULL;
+/* Responses preserve native errors; no global -4/-5 -> success rewrite. */
+void _ZN13MessageRouter19sendChannelOpenRespEhi(void* self,uint8_t channel,int status) {
+    if(!real_send_channel_open_resp)
+        real_send_channel_open_resp=(void(*)(void*,uint8_t,int))dlsym(RTLD_NEXT,"_ZN13MessageRouter19sendChannelOpenRespEhi");
+    if(real_send_channel_open_resp) real_send_channel_open_resp(self,channel,status);
 }
 
-static void dummy_on_channel_opened(void* self, uint8_t ch) {
-    log_line("[gal_cluster] cluster endpoint: onChannelOpened ch=%d\n", (int)ch);
-    if (ch == 14 && !g_cluster_ch14_opened) {
-        g_cluster_ch14_opened = 1;
-        /* Push MEDIA_SETUP_RESPONSE on ch=14 immediately on open. Bytes copied
-         * from gal0's main-channel ch=1 0x8003 — the same 12 bytes that worked
-         * empirically across many sessions when the timing race didn't bite.
-         * Done from here (not gal0-ch=1-mirror) so it always fires AFTER ch=14
-         * is open. Race fix for run 140440 S2. */
-        if (real_queue_outgoing && g_router_ptr) {
-            uint8_t* setup = (uint8_t*)malloc(12);
-            if (setup) {
-                static const uint8_t bytes[12] = {
-                    0x80, 0x03, 0x08, 0x02, 0x10, 0x08,
-                    0x18, 0x00, 0x18, 0x01, 0x18, 0x02
-                };
-                memcpy(setup, bytes, 12);
-                hook_queue_outgoing(g_router_ptr, 14, setup, 12);
-                log_line("[gal_cluster] queueOutgoing: 0x8003 (12B, on-open) -> cluster ch=14\n");
-            }
-        }
-        /* Start fake-main thread when FAKE_MAIN_PROJECTED mode is on.
-         * Thread itself gates per-tick on g_hmi_focus_projected so it only
-         * fires when gal0 has gone silent. Idempotent. */
-        if ((g_fake_main_projected || g_keepalive_ms > 0) && !g_keepalive_running) {
-            g_keepalive_running = 1;
-            if (pthread_create(&g_keepalive_tid, NULL, keepalive_thread_fn, NULL) != 0) {
-                log_line("[gal_cluster] keepalive: pthread_create failed errno=%d\n", errno);
-                g_keepalive_running = 0;
-            }
-        }
-    }
+/* Retain the stock incoming dispatcher and its machine return. Ownership and
+ * data copying happen in the installed per-receiver endpoint callbacks. */
+int32_t _ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE(void* self,uint8_t channel,void* data) {
+    if(!real_routeMessage) real_routeMessage=(int32_t(*)(void*,uint8_t,void*))dlsym(RTLD_NEXT,"_ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE");
+    return real_routeMessage?real_routeMessage(self,channel,data):-5;
 }
-
-/* Hook MessageRouter::routeMessage — the central INCOMING dispatcher in
- * libautoreceiver. Called for every message phone sends to gal0 on any
- * application channel (post-TLS-decrypt, framing-parsed). Lets us see
- * exactly what phone sends back during HMI focus transitions so we can
- * identify what gal0 reacts to.
- *
- * Signature: void MessageRouter::routeMessage(uchar channel, shared_ptr<IoBuffer> const&)
- *
- * Just counts incoming per channel for now; msg_type parsing would require
- * reverse-engineering IoBuffer's internal layout (deferred). The per-second
- * rate_log emit will show how many incoming messages arrived on each channel.
- */
-void _ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE(
-        void* self, uint8_t channel, void* shared_ptr_ref)
-{
-    if (!real_routeMessage)
-        real_routeMessage = (void(*)(void*, uint8_t, void*))
-            dlsym(RTLD_NEXT, "_ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE");
-
-    /* Record one incoming event per channel. */
-    rate_log_record_in(channel, 1);
-
-    /* Parse msg_type from IoBuffer. Layout from Controller::routeMessage
-     * disasm: shared_ptr* + 4 = control block ptr; data = cb[0] + cb[2].
-     * msg_type is the first 2 bytes (BE) of the message data. Mark incoming
-     * by tagging channel with high bit so it doesn't collide with outgoing
-     * in the rate log's types: section. */
-    if (shared_ptr_ref) {
-        intptr_t* cb = *(intptr_t**)((char*)shared_ptr_ref + 4);
-        if (cb) {
-            uint8_t* data = (uint8_t*)(cb[0] + cb[2]);
-            if (data) {
-                uint16_t msg_type = ((uint16_t)data[0] << 8) | data[1];
-                rate_log_record_type((uint8_t)(channel | 0x80), msg_type);
-            }
-        }
-    }
-
-    if (real_routeMessage)
-        real_routeMessage(self, channel, shared_ptr_ref);
+void _ZN10Controller12routeMessageEhtRK10shared_ptrI8IoBufferE(void* self,uint8_t ch,uint16_t type,void* data) {
+    if(!real_controller_routeMessage) real_controller_routeMessage=(void(*)(void*,uint8_t,uint16_t,void*))dlsym(RTLD_NEXT,"_ZN10Controller12routeMessageEhtRK10shared_ptrI8IoBufferE");
+    if(real_controller_routeMessage) real_controller_routeMessage(self,ch,type,data);
 }
-
-/* Per-endpoint route hooks. These fire AFTER MessageRouter dispatches to the
- * appropriate endpoint. We get channel + msg_type cleanly. Log type counts
- * via rate_log_record_type so the types: section shows incoming as well.
- * We tag incoming types with high bit (channel | 0x80) to distinguish from
- * outgoing in the dump — TODO if it muddles the existing log, split later. */
-static void log_incoming_type(uint8_t channel, uint16_t msg_type) {
-    /* Use existing per-(ch,type) counter. Outgoing already populates this
-     * table; incoming will mix in unless we mark differently. For now, use
-     * a synthetic high-bit channel marker so they don't overlap. */
-    rate_log_record_type((uint8_t)(channel | 0x80), msg_type);
-}
-
-void _ZN10Controller12routeMessageEhtRK10shared_ptrI8IoBufferE(
-        void* self, uint8_t channel, uint16_t msg_type, void* shared_ptr_ref)
-{
-    if (!real_controller_routeMessage)
-        real_controller_routeMessage = (void(*)(void*, uint8_t, uint16_t, void*))
-            dlsym(RTLD_NEXT, "_ZN10Controller12routeMessageEhtRK10shared_ptrI8IoBufferE");
-    log_incoming_type(channel, msg_type);
-    if (real_controller_routeMessage)
-        real_controller_routeMessage(self, channel, msg_type, shared_ptr_ref);
-}
-
-void _ZN13MediaSinkBase12routeMessageEhtRK10shared_ptrI8IoBufferE(
-        void* self, uint8_t channel, uint16_t msg_type, void* shared_ptr_ref)
-{
-    if (!real_mediasinkbase_routeMessage)
-        real_mediasinkbase_routeMessage = (void(*)(void*, uint8_t, uint16_t, void*))
-            dlsym(RTLD_NEXT, "_ZN13MediaSinkBase12routeMessageEhtRK10shared_ptrI8IoBufferE");
-    log_incoming_type(channel, msg_type);
-    if (real_mediasinkbase_routeMessage)
-        real_mediasinkbase_routeMessage(self, channel, msg_type, shared_ptr_ref);
-}
-
-static int dummy_cluster_route(void* self, uint32_t ch, uint16_t type, void* data) {
-    static int cluster_data_count = 0;
-    cluster_data_count++;
-    /* Per-event log gated under GAL_CLUSTER_DEBUG (in addition to LOG_ALL master). */
-    if (g_cl.debug && (cluster_data_count <= 10 || (cluster_data_count % 100) == 0)) {
-        log_line("[gal_cluster] cluster data: ch=%u type=0x%04x count=%d data=%p\n",
-                 ch, type, cluster_data_count, data);
-    }
-    /* Reply on the SAME channel the request arrived on, with the CORRECT
-     * reply type per AA protocol.
-     *
-     *   0x8002 MEDIA_SETUP_REQ on ch=21 -> 0x8006 MEDIA_ACK on ch=21 (status=OK)
-     *
-     * Before this: dummy_cluster_route blindly sent MEDIA_ACK on ch=20 for
-     * every incoming event. When phone opened ch=21 first and sent
-     * MEDIA_SETUP_REQ on ch=21 before VIDEO_FOCUS_REQ on ch=20, our ACK
-     * landed on the wrong channel → MEDIA_SETUP_REQ on ch=21 was never
-     * acked → phone stalled 5-10s → watchdog killed gal. (~50% activation
-     * failure.)
-     *
-     * Note: we DO NOT reply to 0x8000 VIDEO_FOCUS_REQ here. The
-     * VIDEO_FOCUS_NOTIFICATION (0x8008) is already sent for cluster ch=20
-     * by the queueOutgoing mirror path (when gal emits 0x8008 on main ch=1).
-     * Sending 0x8008 twice on ch=20 is a protocol violation and phone
-     * disconnects.
-     *
-     * CRITICAL: pass g_router_ptr (captured from MessageRouter calls) as self,
-     * NOT our `self` here (which is the FAKE ENDPOINT). queueOutgoing expects
-     * a MessageRouter*. Passing fake_endpoint → SIGSEGV inside gal. */
-    if (real_queue_outgoing && g_router_ptr && type == 0x8002) {
-        int total = 4; /* 2-byte type + 2-byte payload */
-        uint8_t* msg = (uint8_t*)malloc((size_t)total);
-        if (msg) {
-            msg[0] = 0x80; msg[1] = 0x06;     /* MEDIA_ACK */
-            msg[2] = 0x08; msg[3] = 0x00;     /* status = OK */
-            hook_queue_outgoing(g_router_ptr, (uint8_t)ch, msg, total);
-            if (g_cl.debug)
-                log_line("[gal_cluster] cluster REPLY ch=%u: req=0x%04x -> resp=0x8006 plen=2\n",
-                         ch, (unsigned)type);
-        }
-    }
-    /* Write H.264 data to SHM:
-     * msg_type=0x0001 → codec config (SPS/PPS NALs) — write raw payload
-     * msg_type=0x0000 → video frame — skip 8-byte AA media header (flags+timestamp)
-     * All other msg_types → skip
-     * Channel 14 = cluster video. svc_id=1 was tested — phone rejected. */
-    if (ch == 14 && data && g_cluster_shm) {
-        uint32_t* sp = (uint32_t*)data;
-        if (sp[1]) {
-            uint32_t* inner = (uint32_t*)sp[1];
-            uint8_t* buf = (uint8_t*)inner[0] + inner[2];
-            int total = (int)(inner[3] - inner[2]);
-            /* Rate log: count phone→us bytes on this channel. */
-            if (total > 0) rate_log_record_in((uint8_t)ch, (uint32_t)total);
-            if (total > 2 && total < 500000) {
-                uint16_t msg_type = ((uint16_t)buf[0] << 8) | buf[1];
-                uint8_t* payload = buf + 2; /* skip 2-byte msg_type */
-                int plen = total - 2;
-                if (msg_type == 0x0001) {
-                    /* Codec config (SPS/PPS) — write entire payload as-is */
-                } else if (msg_type == 0x0000 && plen > 8) {
-                    /* Video frame — skip 8-byte AA header (4b flags + 4b timestamp) */
-                    payload += 8;
-                    plen -= 8;
-                } else {
-                    plen = 0; /* skip other msg_types */
-                }
-                /* DIAGNOSTIC: dump first 32 bytes of codec config (once) and first
-                 * frame (once) so we can verify Annex B vs AVCC format. */
-                static int dumped_config = 0, dumped_frame = 0;
-                if (plen > 0 && msg_type == 0x0001 && !dumped_config) {
-                    dumped_config = 1;
-                    int n = plen < 32 ? plen : 32;
-                    char hex[200] = {0}; int o = 0;
-                    for (int i = 0; i < n; i++) o += snprintf(hex+o, sizeof(hex)-o, "%02x ", payload[i]);
-                    log_line("[gal_cluster] CODEC_CONFIG plen=%d first%d: %s\n", plen, n, hex);
-                }
-                if (plen > 0 && msg_type == 0x0000 && !dumped_frame) {
-                    dumped_frame = 1;
-                    int n = plen < 32 ? plen : 32;
-                    char hex[200] = {0}; int o = 0;
-                    for (int i = 0; i < n; i++) o += snprintf(hex+o, sizeof(hex)-o, "%02x ", payload[i]);
-                    log_line("[gal_cluster] FRAME0 plen=%d first%d: %s\n", plen, n, hex);
-                }
-                /* Feed to in-hook decoder */
-                if (plen > 0) cl_feed_h264(payload, plen);
-
-                if (plen > 0 && g_cluster_shm) {
-                    cluster_h264_shm_t* shm = g_cluster_shm;
-                    uint32_t wp = shm->write_pos;
-                    int remain = CLUSTER_RING_SIZE - (int)wp;
-                    if (plen <= remain) {
-                        memcpy(shm->ring + wp, payload, (size_t)plen);
-                    } else {
-                        memcpy(shm->ring + wp, payload, (size_t)remain);
-                        memcpy(shm->ring, payload + remain, (size_t)(plen - remain));
-                    }
-                    shm->write_pos = (wp + (uint32_t)plen) % CLUSTER_RING_SIZE;
-                    shm->total_bytes += (uint32_t)plen;
-                }
-
-                /* Debug-only: write raw H.264 to a growing file in /tmp (RAM)
-                 * for offline ffmpeg decode. Gated by GAL_CLUSTER_DEBUG env var.
-                 * Capped at 20 MB. Format: Annex-B NAL stream. */
-                if (plen > 0 && g_cl.debug) {
-                    static FILE* h264_dump = NULL;
-                    static size_t h264_written = 0;
-                    static int h264_done = 0;
-                    if (!h264_done && !h264_dump) {
-                        h264_dump = fopen("/tmp/cluster_stream.h264", "wb");
-                        if (!h264_dump) {
-                            log_line("[gal_cluster] cluster_stream.h264 fopen failed errno=%d\n", errno);
-                            h264_done = 1;
-                        }
-                    }
-                    if (h264_dump && !h264_done) {
-                        size_t cap = 20 * 1024 * 1024;
-                        size_t to_write = (size_t)plen;
-                        if (h264_written + to_write > cap) to_write = cap - h264_written;
-                        if (to_write > 0) {
-                            fwrite(payload, 1, to_write, h264_dump);
-                            h264_written += to_write;
-                        }
-                        if (h264_written >= cap) {
-                            fflush(h264_dump);
-                            fclose(h264_dump);
-                            h264_dump = NULL;
-                            h264_done = 1;
-                            log_line("[gal_cluster] cluster_stream.h264 capped at %zu bytes\n", h264_written);
-                        }
-                    }
-                }
-                if (g_cl.debug && (cluster_data_count <= 5 || (cluster_data_count % 500) == 0)) {
-                    log_line("[gal_cluster] cluster shm: frame=%d mt=0x%04x plen=%d total=%u wp=%u\n",
-                             cluster_data_count, msg_type, plen, g_cluster_shm->total_bytes,
-                             g_cluster_shm->write_pos);
-                }
-            }
-        }
-    }
-    return 0;
-}
-static int vtable_stub(void) { return 0; }
-static void* fake_vtable[16] = {0};
-static uint32_t fake_endpoint[16] = {0};
-
-void _ZN13MessageRouter19sendChannelOpenRespEhi(void* self, uint8_t ch, int status)
-{
-    if (!g_router_ptr) g_router_ptr = self;
-    if (!real_send_channel_open_resp)
-        real_send_channel_open_resp = (void(*)(void*,uint8_t,int))
-            dlsym(RTLD_NEXT, "_ZN13MessageRouter19sendChannelOpenRespEhi");
-    if (!real_register_channel)
-        real_register_channel = (int(*)(void*,uint8_t,int8_t))
-            dlsym(RTLD_DEFAULT, "_ZN14ChannelManager15registerChannelEha");
-    if (!real_setup_mapping)
-        real_setup_mapping = (void(*)(void*,uint8_t,uint8_t))
-            dlsym(RTLD_DEFAULT, "_ZN13MessageRouter12setupMappingEhh");
-
-    /* Install fake endpoint on FIRST sendChannelOpenResp call (any channel).
-     * This ensures the endpoint is in the table BEFORE handleChannelOpenReq
-     * runs for cluster channels 20/21. */
-    {
-        static int endpoint_installed = 0;
-        if (!endpoint_installed && g_cluster_enabled) {
-            { int vi; for (vi = 0; vi < 16; vi++) fake_vtable[vi] = (void*)vtable_stub; }
-            fake_vtable[3] = (void*)dummy_may_open;
-            fake_vtable[4] = (void*)dummy_on_channel_opened;
-            fake_vtable[5] = (void*)dummy_cluster_route;
-            fake_endpoint[0] = (uint32_t)fake_vtable;
-            fake_endpoint[4] = 0;
-
-            /* Install for service 14 (cluster video) and 21 (cluster input).
-             * Tested svc_id=1 — phone rejected (reserves id=1 for AudioSource),
-             * gal cycled through repeat restarts. svc_id=14 is best so far. */
-            uint32_t slot14 = (14 + 0x40) * 4;
-            uint32_t slot21 = (21 + 0x40) * 4;
-            *(uint32_t**)((uint8_t*)self + slot14) = fake_endpoint;
-            *(uint32_t**)((uint8_t*)self + slot21) = fake_endpoint;
-            endpoint_installed = 1;
-            log_line("[gal_cluster] fake endpoint installed at router+0x%x and +0x%x for svc 14,21\n",
-                     slot14, slot21);
-        }
-    }
-
-    /* For cluster channels: handleChannelOpenReq will now find our fake endpoint,
-     * call mayOpenChannel→1, setupMapping, return 0. The normal flow then calls
-     * registerChannel, sendChannelOpenResp(0), notifyChannelOpened — all properly.
-     * No special handling needed here. */
-    if (status == (int)0xfffffffc || status == (int)0xfffffffb) {
-        /* This shouldn't happen anymore for cluster channels (they have endpoints now).
-         * But keep as safety net for any other unknown services. */
-        log_line("[gal_cluster] sendChannelOpenResp: ch=%d status=%d -> ACCEPTING (safety net)\n", (int)ch, status);
-        status = 0;
-    } else {
-        log_line("[gal_cluster] sendChannelOpenResp: ch=%d status=%d\n", (int)ch, status);
-    }
-
-    if (real_send_channel_open_resp)
-        real_send_channel_open_resp(self, ch, status);
+int32_t _ZN13MediaSinkBase12routeMessageEhtRK10shared_ptrI8IoBufferE(void* self,uint8_t ch,uint16_t type,void* data) {
+    if(!real_mediasinkbase_routeMessage) real_mediasinkbase_routeMessage=(int32_t(*)(void*,uint8_t,uint16_t,void*))dlsym(RTLD_NEXT,"_ZN13MediaSinkBase12routeMessageEhtRK10shared_ptrI8IoBufferE");
+    return real_mediasinkbase_routeMessage?real_mediasinkbase_routeMessage(self,ch,type,data):-5;
 }
 
 /* NavFocusRequestNotification hook — logs focus requests */

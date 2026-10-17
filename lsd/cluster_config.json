@@ -21,6 +21,7 @@
     "imperialSmallUnit": "auto",
     "destinationDisplayDuration": 5000,
     "enableMapRender": true,
+    "enableLifecyclePort": false,
     "mirrorFifo": "/tmp/cluster_ctl",
     "mirrorMode": "fill",
     "mirrorZoomX": 1.0,

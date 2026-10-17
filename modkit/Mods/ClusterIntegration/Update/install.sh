@@ -51,6 +51,17 @@ set -u
 export MOD_PATH="${modPath:-${MOD_PATH:-}}"
 [[ -z "$MOD_PATH" ]] && { print -u2 "ERROR: MOD_PATH not set"; exit 1; }
 
+[[ -f "$MOD_PATH/logging.sh" ]] || { print -u2 "ERROR: logging.sh missing"; exit 1; }
+. "$MOD_PATH/logging.sh"
+ci_log_init install || exit 1
+
+# Prove that this card can verify its recovery originals before installing.
+# The child writes its own numbered log and makes no live changes.
+ci_run /bin/ksh "$MOD_PATH/uninstall.sh" --check || {
+    print -u2 "ERROR: rollback preflight failed; installation blocked. See rollback log."
+    exit 3
+}
+
 [[ ! -e /mnt/app ]] && mount -t qnx6 /dev/mnanda0t177.1 /mnt/app
 mount -uw /mnt/app/
 
@@ -268,6 +279,10 @@ fi
 typeset rootcfg
 for rootcfg in /fs/usb0_0 /fs/usb1_0 /fs/sda0 /fs/sdb0; do
     if [[ -f "$rootcfg/cluster_config.json" ]]; then
+        if [[ -e "$MOD_ROOT/diag.txt" ]]; then
+            print -u2 "ERROR: $rootcfg/cluster_config.json overrides diagnostic settings; remove it before this diagnostic install."
+            exit 4
+        fi
         print "WARN: $rootcfg/cluster_config.json exists and overrides the installed config while inserted; config_overrides.txt and diag mode have no effect until it is removed."
     fi
 done
@@ -456,7 +471,7 @@ mkdir -p "$BACKUP_DIR" || {
 }
 mkdir -p "$CLUSTER_DIR"
 
-ts() { date +"%Y%m%d_%H%M%S"; }
+ts() { ci_stamp; }
 
 # Change manifest: one line per file the installer adds, replaces, swaps or
 # removes, with the backup copy it made. Appended on every run so the
@@ -798,7 +813,8 @@ if [[ -e "$MOD_ROOT/diag.txt" ]]; then
         note "override $CLUSTER_DIR/cluster_config.json enableMapRender=false (diag)"
         print "diag mode:         installed cluster_config.json has enableMapRender=false (turn-by-turn only)"
     else
-        print "diag mode:         WARN could not set enableMapRender=false in cluster_config.json; video path left enabled"
+        print -u2 "ERROR: cannot disable map rendering for diagnostic mode; run rollback.sh"
+        exit 3
     fi
     print "diag mode:         ON  ($DIAG_MARKER) - hook logs only, cluster service NOT injected"
     # Stage the small stock jars that contain the classes this mod shadows,
@@ -896,4 +912,5 @@ print "Diagnostics:       put diag.txt in Mods/ClusterIntegration/ and re-run to
 print "Rollback:          put uninstall.txt in Mods/ClusterIntegration/ and re-run the ModKit,"
 print "                   or over SSH: ksh $MOD_PATH/rollback.sh"
 print "Done."
+CI_RESULT=INSTALL_SCRIPT_COMPLETE
 

@@ -52,7 +52,7 @@ import org.osgi.framework.BundleContext;
 import java.util.ArrayList;
 import java.util.List;
 
-public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSafe, PartialPopupBAPServiceListener {
+public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSafe, PartialPopupBAPServiceListener, ClusterLifecycle.Effects {
     private static final String LOGCLASS = "AndroidAutoClusterIntegration";
     private static final String DEFAULT_LOG_PATH           = "/tmp";
     private static final String LOG_FILE_NAME              = "cluster.log";
@@ -139,6 +139,12 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
 
     // Map rendering / AA mirror config
     private boolean enableMapRender      = false;
+    private boolean enableLifecyclePort = false; // explicit draft opt-in, no legacy fallback
+    private boolean aaSessionActive, lifecycleDisposed;
+    private long bapGeneration;
+    private ClusterLifecycle lifecycle;
+    private String lifecycleIdentity;
+    private Thread lifecycleWorker;
     private String  mirrorFifo           = "/tmp/cluster_ctl";
     private String  mirrorMode           = "fill";
     private float   mirrorZoomX          = 1.0f;
@@ -267,6 +273,7 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
     private long destinationShownTime = 0;
     private int destinationDisplayDuration = 2000;  // milliseconds (default 2 seconds)
     private java.util.Timer pendingClearTimer = null;
+    private Timer popupClearTimer;
 
 
     // ManeuverState tracking
@@ -624,12 +631,12 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         logDriveSideDebug();
     }
 
-    public void setKombiMapViewerControl(DSIMapViewerControl service) {
+    public synchronized void setKombiMapViewerControl(DSIMapViewerControl service) {
         this.kombiMapViewerControl = service;
         logCluster("KOMBI_MAP: DSIMapViewerControl(KOMBI=3) registered");
     }
 
-    public void setMapClusterService(Object service) {
+    public synchronized void setMapClusterService(Object service) {
         this.mapClusterService = service;
         logCluster("KOMBI_MAP: IMapClusterService registered (class=" +
                    (service != null ? service.getClass().getName() : "null") + ")");
@@ -868,15 +875,8 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
                        + " panX=" + mirrorPanX + " panY=" + mirrorPanY
                        + " aaClusterMode=" + aaClusterMode);
 
-            // If mirror is already running with stale zoom/pan (videoAvailable fired before
-            // resolveCarConfig completed), restart it now with the correct values.
-            if (videoCurrentlyAvailable && enableMapRender) {
-                String cmd = "start mode=" + mirrorMode
-                           + " zoomX=" + mirrorZoomX + " zoomY=" + mirrorZoomY
-                           + " panX=" + mirrorPanX + " panY=" + mirrorPanY;
-                logCluster("CAR_VARIANT: restarting mirror with resolved params — " + cmd);
-                sendMirrorCommand(cmd);
-            }
+            // Apply geometry to the next fresh lifecycle session; never bypass
+            // its release barrier with a legacy start command.
 
         } catch (Exception e) {
             logCluster("CAR_VARIANT: error detecting variant: " + e.toString() + " -> using global values");
@@ -1667,6 +1667,12 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
                 }
             }
 
+            int lifecyclePos = json.indexOf("\"enableLifecyclePort\"", configStart);
+            if (lifecyclePos >= 0 && lifecyclePos < configStart + 2000) {
+                int colon = json.indexOf(":", lifecyclePos);
+                if (colon > 0) enableLifecyclePort = json.substring(colon + 1).trim().startsWith("true");
+            }
+
             int mirrorFifoPos = json.indexOf("\"mirrorFifo\"", configStart);
             if (mirrorFifoPos >= 0 && mirrorFifoPos < configStart + 2000) {
                 int colon = json.indexOf(":", mirrorFifoPos);
@@ -1975,7 +1981,7 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
      * Starts BAP heartbeat to continuously override native nav messages.
      * Resends RGStatus=1, maneuver, and distance at configured interval.
      */
-    private void startHeartbeat() {
+    private synchronized void startHeartbeat() {
         // Check if heartbeat is enabled in config
         if (!heartbeatEnabled) {
             logCluster("BAP_HEARTBEAT: Disabled by config (enableHeartbeat=false)");
@@ -1987,9 +1993,12 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
 
         logCluster("BAP_HEARTBEAT: Starting (resend every " + heartbeatInterval + "ms to override native nav)");
 
+        final long admittedGeneration = bapGeneration;
         heartbeatTimer = new Timer(true); // Daemon thread (Java 1.4 compatible)
         heartbeatTimer.schedule(new TimerTask() {
             public void run() {
+                synchronized (AndroidAutoClusterIntegration.this) {
+                if (admittedGeneration != bapGeneration || !aaSessionActive) return;
                 try {
                     if (clusterService == null || !navigationActive) {
                         return;
@@ -2021,6 +2030,7 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
                 } catch (Exception e) {
                     logCluster("BAP_HEARTBEAT: Error resending data: " + e.toString());
                 }
+                }
             }
         }, heartbeatInterval, heartbeatInterval); // Start after interval, repeat every interval
     }
@@ -2028,7 +2038,7 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
     /**
      * Stops BAP heartbeat timer.
      */
-    private void stopHeartbeat() {
+    private synchronized void stopHeartbeat() {
         if (heartbeatTimer != null) {
             logCluster("BAP_HEARTBEAT: Stopping");
             heartbeatTimer.cancel();
@@ -2036,8 +2046,10 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         }
     }
 
-    public void navFocusRequestNotification(NavigationFocusType navFocusType, int validFlag) {
+    public synchronized void navFocusRequestNotification(NavigationFocusType navFocusType, int validFlag) {
+        if (!aaSessionActive || validFlag != 1 || navFocusType == null) return;
         boolean isProjected = navFocusType.equals(NavigationFocusType.PROJECTED);
+        boolean wasProjected = this.navigationActive;
         this.navigationActive = isProjected;
 
         // Log Android Auto DSI input
@@ -2069,13 +2081,14 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         } else {
             // Stop heartbeat when switching to native nav
             stopHeartbeat();
-            clearCluster();
+            if (wasProjected) clearCluster();
             destinationEventSeen = false;  // Reset for next navigation session
         }
     }
 
-    public void updateNavigationNextTurnEvent(String roadName, int turnSide, int eventCode,
+    public synchronized void updateNavigationNextTurnEvent(String roadName, int turnSide, int eventCode,
                                              int angle, int num, int validFlag) {
+        if (!aaSessionActive || !navigationActive || validFlag != 1) return;
         // Log Android Auto DSI input with analysis
         String description = describeTurnEvent(eventCode, turnSide, angle);
         logCluster("DSI_IN: TURN_EVENT | road=\"" + (roadName != null ? roadName : "") +
@@ -2205,7 +2218,8 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         }
     }
 
-    public void updateNavigationNextTurnDistance(int distance, int timeToTurn, int validFlag) {
+    public synchronized void updateNavigationNextTurnDistance(int distance, int timeToTurn, int validFlag) {
+        if (!aaSessionActive || !navigationActive || validFlag != 1) return;
         // Log Android Auto DSI input with proximity analysis
         String proximity = getProximityDescription(distance);
         logCluster("DSI_IN: DISTANCE | distance=" + distance + "m time=" + timeToTurn + "s valid=" + validFlag + " | " + proximity);
@@ -2952,7 +2966,7 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         return bargraph < 0 ? 0 : (bargraph > 100 ? 100 : bargraph);
     }
 
-    private void clearCluster() {
+    private synchronized void clearCluster() {
         if (clusterService == null) {
             return;
         }
@@ -2966,10 +2980,13 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
                 long remainingDelay = destinationDisplayDuration - elapsed;
                 logCluster("BAP_CLEAR: Scheduling delayed clear in " + remainingDelay + "ms to show destination");
                 cancelPendingClear();
+                final long admittedGeneration = bapGeneration;
                 pendingClearTimer = new java.util.Timer(true);
                 pendingClearTimer.schedule(new java.util.TimerTask() {
                     public void run() {
-                        doClearCluster();
+                        synchronized (AndroidAutoClusterIntegration.this) {
+                            if (admittedGeneration == bapGeneration && !navigationActive) doClearCluster();
+                        }
                     }
                 }, remainingDelay);
                 return;
@@ -2979,7 +2996,7 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         doClearCluster();
     }
 
-    private void cancelPendingClear() {
+    private synchronized void cancelPendingClear() {
         if (pendingClearTimer != null) {
             logCluster("BAP_CLEAR: Cancelling pending delayed clear (navigation restarted)");
             pendingClearTimer.cancel();
@@ -2987,7 +3004,7 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         }
     }
 
-    private void doClearCluster() {
+    private synchronized void doClearCluster() {
         if (clusterService == null) {
             return;
         }
@@ -3005,24 +3022,30 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         }
     }
 
-    public void onAndroidAutoTerminated() {
-        try {
-            logCluster("SYS: ANDROID_AUTO_TERMINATED - Clearing cluster and resetting state");
+    public synchronized void onAndroidAutoTerminated() {
+        aaSessionActive = false;
+        retireBAP();
+        if (lifecycle != null) lifecycle.terminate("AA terminated / DSI unavailable");
+        videoCurrentlyAvailable = false;
+        clusterState = CL_IDLE;
+    }
 
-            this.navigationActive = false;
-            videoCurrentlyAvailable = false;
-            clusterState = CL_IDLE;
-            stopHeartbeat();  // Stop heartbeat timer
-            clearCluster();
-
-            if (enableMapRender) {
-                logCluster("MIRROR: stopping (AA terminated)");
-                sendMirrorCommand("stop");
-                // wakeNativeNavCluster();  // disabled — does nothing useful in practice
-            }
-        } catch (Exception e) {
-            logCluster("ERROR in onAndroidAutoTerminated: " + e.toString());
-        }
+    private void retireBAP() {
+        boolean hadBAP = navigationActive || lastManeuverArray != null || lastDisplayValue >= 0;
+        ++bapGeneration;
+        navigationActive = false;
+        stopHeartbeat(); cancelPendingClear();
+        if (popupClearTimer != null) { popupClearTimer.cancel(); popupClearTimer = null; }
+        destinationShownTime = 0; destinationEventSeen = false;
+        lastManeuverArray = null; lastRoadName = null; lastSignPost = null;
+        lastDisplayValue = -1; lastUnit = -1; lastBargraph = -1;
+        lastTimeToDestination = 0; lastDistanceToDestination = 0;
+        lastManeuverKey = null; maneuverInitialDistance = 0;
+        lastEventCode = -1; lastTurnSide = -1; lastDistance = -1; lastUpdateTime = 0;
+        cachedRoundaboutDirection = -1; resetManeuverOnNextDistance = false;
+        waitingForPostTurnTurnEvent = false; resetCameFromRoundabout = false;
+        if (hadBAP) doClearCluster(); // never clear OEM guidance when we owned no BAP output
+        logCluster("LIFECYCLE: BAP retired generation=" + bapGeneration);
     }
 
     /**
@@ -3115,123 +3138,107 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
         logCluster("DSI_IN: VIDEO_FOCUS | focus=" + focus + " valid=" + validFlag);
     }
 
-    public void videoAvailable(boolean available, int validFlag) {
-        logCluster("DSI_IN: VIDEO_AVAILABLE | available=" + available + " valid=" + validFlag);
-
+    public synchronized void videoAvailable(boolean available, int validFlag) {
+        if (validFlag != 1 || !aaSessionActive || lifecycleDisposed) {
+            logCluster("LIFECYCLE: ignored invalid/out-of-session video notification");
+            return;
+        }
         videoCurrentlyAvailable = available;
-
-        if (!enableMapRender) {
-            logCluster("CLUSTER: map_rendering disabled in config, skipping");
-            return;
-        }
-
-        boolean isH264 = "h264".equalsIgnoreCase(aaClusterMode);
-
-        if (available) {
-            if (isH264) {
-                // h264 path. Warm child was prepared in onAndroidAutoActivated().
-                // resume/pause keep the child alive across HMI cycles so the
-                // initial IDR caught at session start remains valid. During
-                // STAGE_PAUSED the h264 child itself paints the canim splash
-                // — no separate canim process spawned, no disp-33 binding
-                // handoff problem.
-                switch (clusterState) {
-                    case CL_PREPARED:
-                        logCluster("CLUSTER h264: PREPARED → RENDERING (resume)");
-                        sendMirrorCommand("resume");
-                        clusterState = CL_RENDERING;
-                        break;
-                    case CL_PAUSED:
-                        logCluster("CLUSTER h264: PAUSED → RENDERING (resume)");
-                        sendMirrorCommand("resume");
-                        clusterState = CL_RENDERING;
-                        break;
-                    case CL_RENDERING:
-                        logCluster("CLUSTER h264: already RENDERING, ignoring videoAvailable(true)");
-                        break;
-                    default:
-                        logCluster("CLUSTER h264: unexpected state=" + clusterState
-                                   + " on videoAvailable(true); recovering with prepare+resume");
-                        sendMirrorCommand("prepare capture=h264");
-                        sendMirrorCommand("resume");
-                        clusterState = CL_RENDERING;
-                        break;
-                }
-            } else {
-                // mirror: always start fresh. IDLE ↔ RENDERING via start/stop.
-                String cmd = "start mode=" + mirrorMode
-                           + " zoomX=" + mirrorZoomX + " zoomY=" + mirrorZoomY
-                           + " panX=" + mirrorPanX + " panY=" + mirrorPanY;
-                logCluster("CLUSTER mirror: start -- " + cmd);
-                sendMirrorCommand(cmd);
-                clusterState = CL_RENDERING;
-            }
-        } else {
-            // videoAvailable(false)
-            if (isH264) {
-                // Pause warm h264 child. Daemon SIGUSR2s it; child enters
-                // STAGE_PAUSED, paints canim itself. Same window, same
-                // disp-33 binding — recovery on next resume is just a
-                // VISIBLE flip plus stage flip, no binding handoff.
-                if (clusterState == CL_RENDERING) {
-                    logCluster("CLUSTER h264: RENDERING → PAUSED (pause)");
-                    sendMirrorCommand("pause");
-                    clusterState = CL_PAUSED;
-                } else {
-                    logCluster("CLUSTER h264: videoAvailable(false) in state=" + clusterState
-                               + ", no command");
-                }
-            } else {
-                // mirror: stop kills the child; daemon spawns canim splash
-                // separately (mirror's process being dead means no binding
-                // conflict with the canim_splash process).
-                if (clusterState == CL_RENDERING) {
-                    logCluster("CLUSTER mirror: RENDERING → IDLE (stop)");
-                    sendMirrorCommand("stop");
-                    clusterState = CL_IDLE;
-                } else {
-                    logCluster("CLUSTER mirror: videoAvailable(false) in state=" + clusterState
-                               + ", no command");
-                }
-            }
-        }
+        if (lifecycle != null) lifecycle.video(available);
+        if (!available) retireBAP();
     }
 
-    /**
-     * Called once per phone-connect, before any DSI traffic. Pairs with
-     * onAndroidAutoTerminated(). For h264 mode: spawn the cluster decoder
-     * child early via `prepare` so it's warmed up before videoAvailable(true).
-     * For mirror mode: no-op (mirror has no useful warm state — spawns at
-     * videoAvailable(true)).
-     */
-    public void onAndroidAutoActivated() {
-        logCluster("SYS: ANDROID_AUTO_ACTIVATED (aaClusterMode=" + aaClusterMode + ")");
-        clusterState = CL_IDLE;
-        if (!enableMapRender) {
-            logCluster("CLUSTER: map_rendering disabled in config, skipping prepare");
+    public synchronized void onAndroidAutoActivated() {
+        if (lifecycleDisposed || aaSessionActive) return;
+        retireBAP(); aaSessionActive = true;
+        videoCurrentlyAvailable = false; clusterState = CL_IDLE;
+        if (!enableMapRender || !enableLifecyclePort || !"h264".equalsIgnoreCase(aaClusterMode)) {
+            logCluster("LIFECYCLE: native map port inactive (requires enableMapRender, enableLifecyclePort and h264)");
             return;
         }
-        if ("h264".equalsIgnoreCase(aaClusterMode)) {
-            sendMirrorCommand("prepare capture=h264");
-            clusterState = CL_PREPARED;
+        if (lifecycle == null) {
+            try {
+                lifecycleIdentity = ClusterLifecycleFiles.identity();
+                lifecycle = new ClusterLifecycle(lifecycleIdentity, this);
+            } catch (Exception e) {
+                logCluster("LIFECYCLE: initialization refused: " + e.toString()); return;
+            }
+            lifecycleWorker = new Thread(new Runnable() {
+                public void run() {
+                    while (true) {
+                        synchronized (AndroidAutoClusterIntegration.this) {
+                            if (lifecycleDisposed) return;
+                            try {
+                                lifecycle.tick(System.currentTimeMillis(), ClusterLifecycleFiles.read(ClusterLifecycleFiles.STATUS));
+                            } catch (Exception e) { lifecycle.fail("status read: " + e.toString()); }
+                            if (aaSessionActive && !lifecycle.isActive()) { aaSessionActive = false; retireBAP(); }
+                            clusterState = lifecycle.phase(); // diagnostics only
+                        }
+                        try { Thread.sleep(250); } catch (InterruptedException e) { return; }
+                    }
+                }
+            }, "mib2p-cluster-lifecycle");
+            lifecycleWorker.setDaemon(true); lifecycleWorker.start();
         }
-        // mirror: stay CL_IDLE; videoAvailable(true) will start it.
+        lifecycle.activate("mode=" + mirrorMode + " zoomX=" + mirrorZoomX + " zoomY=" + mirrorZoomY
+            + " panX=" + mirrorPanX + " panY=" + mirrorPanY);
     }
 
-    private void sendMirrorCommand(final String cmd) {
-        if (!new File(mirrorFifo).exists()) {
-            logCluster("MIRROR: fifo not found, daemon not running? (" + mirrorFifo + ")");
-            return;
+    public synchronized void initializeLifecycle() {
+        if (!lifecycleDisposed) return;
+        if (lifecycleWorker != null && lifecycleWorker.isAlive()) {
+            logCluster("LIFECYCLE: previous worker not joined; refusing overlapping owner"); return;
+        }
+        lifecycleWorker = null; lifecycle = null; lifecycleIdentity = null;
+        lifecycleDisposed = false; aaSessionActive = false;
+    }
+
+    public void publish(String record) throws Exception {
+        ClusterLifecycleFiles.publish(ClusterLifecycleFiles.REQUEST, record, lifecycleIdentity);
+    }
+    public void log(String message) { logCluster("LIFECYCLE: " + message); }
+
+    public boolean requestOEMRestore() {
+        if (mapClusterService == null) {
+            logCluster("LIFECYCLE: OEM restoration pending: IMapClusterService unavailable");
+            return false;
         }
         try {
-            java.io.FileWriter fw = new java.io.FileWriter(mirrorFifo, false);
-            fw.write(cmd + "\n");
-            fw.flush();
-            fw.close();
-            logCluster("MIRROR: sent '" + cmd + "' to " + mirrorFifo);
+            Class type = mapClusterService.getClass();
+            type.getMethod("switchKombiMapToAShownContext", new Class[0]).invoke(mapClusterService, new Object[0]);
+            type.getMethod("notifyViewSizeChanged", new Class[]{Boolean.TYPE}).invoke(mapClusterService, new Object[]{Boolean.TRUE});
+            type.getMethod("resumeSetupAndStore", new Class[0]).invoke(mapClusterService, new Object[0]);
+            // These are requests, not evidence of visible OEM pixels. Do not
+            // force a hide/show cycle or clear unrelated OEM layers here.
+            logCluster("LIFECYCLE: OEM map lifecycle requests accepted; visibility unconfirmed");
+            return true;
         } catch (Exception e) {
-            logCluster("MIRROR: failed to write to " + mirrorFifo + ": " + e.toString());
+            logCluster("LIFECYCLE: OEM restoration request failed: " + e.toString()); return false;
         }
+    }
+
+    public void disposeLifecycle() {
+        Thread worker;
+        synchronized (this) {
+            onAndroidAutoTerminated();
+            worker = lifecycleWorker;
+        }
+        // Give the live owner time to receive the exit acknowledgement before
+        // closing services. Join OUTSIDE its monitor. On failure, the native
+        // lease still expires; no unconfirmed display restore is reported.
+        for (int attempt = 0; worker != null && attempt < 70; ++attempt) {
+            synchronized (this) {
+                if (lifecycle == null || !lifecycle.restorationPending()) break;
+            }
+            try { Thread.sleep(50); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
+        synchronized (this) { lifecycleDisposed = true; }
+        if (worker != null && worker != Thread.currentThread()) {
+            worker.interrupt();
+            try { worker.join(1000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            if (worker.isAlive()) logCluster("LIFECYCLE: worker join incomplete; native lease recovery required");
+        }
+        synchronized (this) { if (worker == null || !worker.isAlive()) lifecycleWorker = null; }
     }
 
     public void audioFocusRequestNotification(int focus, int validFlag) {
@@ -3289,13 +3296,18 @@ public class AndroidAutoClusterIntegration implements DSIAndroidAuto2ListenerSaf
 
             // Schedule clear after timeout
             final CombiBAPServiceNavi svc = clusterService;
-            new Timer(true).schedule(new TimerTask() {
+            final long admittedGeneration = bapGeneration;
+            popupClearTimer = new Timer(true);
+            popupClearTimer.schedule(new TimerTask() {
                 public void run() {
+                    synchronized (AndroidAutoClusterIntegration.this) {
+                    if (admittedGeneration != bapGeneration || !aaSessionActive) return;
                     try {
                         svc.updateCurrentPositionInfo(new CurrentPositionInfo(""));
                         logCluster("CID:CLR");
                     } catch (Exception e) {
                         logCluster("CID:CLR_ERR " + e.toString());
+                    }
                     }
                 }
             }, d2);

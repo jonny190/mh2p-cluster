@@ -1,0 +1,123 @@
+{
+  "stock_receiver_sha256": "fb1ffd3196aa99bc254e57c6f432ea53f5ac3070a63b69e6b41a5ff40de8e50b",
+  "exports_checked": [
+    {
+      "name": "_ZN10Controller12routeMessageEhtRK10shared_ptrI8IoBufferE",
+      "thumb_pointer": 962145,
+      "entry": 962144
+    },
+    {
+      "name": "_ZN11GalReceiver15prepareShutdownEv",
+      "thumb_pointer": 963409,
+      "entry": 963408
+    },
+    {
+      "name": "_ZN11GalReceiver15registerServiceEP20ProtocolEndpointBase",
+      "thumb_pointer": 963681,
+      "entry": 963680
+    },
+    {
+      "name": "_ZN13MediaSinkBase12routeMessageEhtRK10shared_ptrI8IoBufferE",
+      "thumb_pointer": 984077,
+      "entry": 984076
+    },
+    {
+      "name": "_ZN13MessageRouter12closeChannelEh",
+      "thumb_pointer": 986345,
+      "entry": 986344
+    },
+    {
+      "name": "_ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE",
+      "thumb_pointer": 985525,
+      "entry": 985524
+    },
+    {
+      "name": "_ZN13MessageRouter13queueOutgoingEhPvj",
+      "thumb_pointer": 985677,
+      "entry": 985676
+    },
+    {
+      "name": "_ZN13MessageRouter19sendChannelOpenRespEhi",
+      "thumb_pointer": 985877,
+      "entry": 985876
+    },
+    {
+      "name": "_ZN13MessageRouter20handleChannelOpenReqEhRK18ChannelOpenRequest",
+      "thumb_pointer": 985221,
+      "entry": 985220
+    },
+    {
+      "name": "_ZN13MessageRouter24queueOutgoingUnencryptedEhPvj",
+      "thumb_pointer": 985701,
+      "entry": 985700
+    },
+    {
+      "name": "_ZN13MessageRouter32populateServiceDiscoveryResponseEP24ServiceDiscoveryResponse",
+      "thumb_pointer": 985725,
+      "entry": 985724
+    },
+    {
+      "name": "_ZN13MessageRouter4initEP14ChannelManager",
+      "thumb_pointer": 985173,
+      "entry": 985172
+    },
+    {
+      "name": "_ZN13MessageRouter8shutdownEv",
+      "thumb_pointer": 985209,
+      "entry": 985208
+    },
+    {
+      "name": "_ZN24NavigationStatusEndpoint16addDiscoveryInfoEP24ServiceDiscoveryResponse",
+      "thumb_pointer": 986541,
+      "entry": 986540
+    },
+    {
+      "name": "_ZN24NavigationStatusEndpoint22handleNavigationStatusERK16NavigationStatus",
+      "thumb_pointer": 986889,
+      "entry": 986888
+    },
+    {
+      "name": "_ZN24NavigationStatusEndpoint29handleNavigationDistanceEventERK31NavigationNextTurnDistanceEvent",
+      "thumb_pointer": 987449,
+      "entry": 987448
+    },
+    {
+      "name": "_ZN24NavigationStatusEndpoint29handleNavigationNextTurnEventERK23NavigationNextTurnEvent",
+      "thumb_pointer": 986901,
+      "entry": 986900
+    },
+    {
+      "name": "_ZN24NavigationStatusEndpoint4stopEv",
+      "thumb_pointer": 987945,
+      "entry": 987944
+    },
+    {
+      "name": "_ZN24NavigationStatusEndpoint5startEv",
+      "thumb_pointer": 987837,
+      "entry": 987836
+    },
+    {
+      "name": "_ZN27NavFocusRequestNotification27MergePartialFromCodedStreamEPN6google8protobuf2io16CodedInputStreamE",
+      "thumb_pointer": 876545,
+      "entry": 876544
+    }
+  ],
+  "start_field_numbers": {
+    "_ZN5Start21kSessionIdFieldNumberE": 1,
+    "_ZN5Start30kConfigurationIndexFieldNumberE": 2,
+    "_ZN3Ack21kSessionIdFieldNumberE": 1,
+    "_ZN3Ack15kAckFieldNumberE": 2
+  },
+  "limits": "Existence only; no QNX loader-hit, complete ABI, mutex ordering, NvMedia or Screen proof.",
+  "contracts": {
+    "router_init": "int32, forwards1/0; target0xf0854",
+    "router_shutdown": "void; target0xf0878",
+    "receiver_prepare": "void; target0xeb350",
+    "local_close": "void; target0xf0ce8",
+    "endpoint_close": "previous open gate; target0xf2948",
+    "service_table": "0x100 + service*4",
+    "manager_pointer": "0x4fc",
+    "iobuffer": "wrapper+4 -> bytes+0, capacity+4, offset+8, end+12",
+    "send_copy": "ChannelManager::messageToFrames0xe8268 malloc+memcpy before return; free our injected buffers only"
+  }
+}
