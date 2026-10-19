@@ -1,163 +1,185 @@
 #!/bin/ksh
-#
-# Copyright (c) 2026 fifthBro
-# https://fifthbro.github.io
-#
-# Licensed under CC BY-NC-SA 4.0
-# https://creativecommons.org/licenses/by-nc-sa/4.0/
-# NOT FOR COMMERCIAL USE
-#
-# uninstall.sh 
-#
-# Idempotent uninstaller. Re-runs are safe.
-# - Restores original gal binary: removes wrapper at /mnt/app/eso/bin/apps/gal
-#   and moves gal.real back to gal.
-# - Same for dio_manager.
-# - Backs up and removes JAR + native binaries from their install dirs
-#   (every ClusterIntegration_* jar, which includes the Audi stand-in jar
-#   ClusterIntegration_StorageMountHandler_stub.jar).
-# - If NAME.real is missing but NAME is still our wrapper, restores the
-#   original from Backup/NAME.real on the SD card.
-# - Appends what it did to Backup/manifest.txt.
-
+# Copyright (c) 2026 fifthBro. Recovery improvements: CC BY-NC-SA 4.0.
+# See LICENSE.md. NOT FOR COMMERCIAL USE.
+# --check writes SD logs/probes only; --self-test uses an isolated SD sandbox.
 set -u
-
 export MOD_PATH="${modPath:-${MOD_PATH:-}}"
-[[ -z "$MOD_PATH" ]] && { print -u2 "ERROR: MOD_PATH not set"; exit 1; }
-
-[[ ! -e /mnt/app ]] && mount -t qnx6 /dev/mnanda0t177.1 /mnt/app
-mount -uw /mnt/app/
-
-# Same PATH extension as install.sh (part of the unit's toolset lives under
-# /mnt/app/armle); appended, never prepended.
+[[ -n "$MOD_PATH" && -f "$MOD_PATH/logging.sh" && -f "$MOD_PATH/comparison.sh" ]] || { print -u2 'ERROR: MOD_PATH/logging.sh/comparison.sh missing'; exit 1; }
+MOD_PATH="$(cd "$MOD_PATH" && pwd)" || exit 1
 export PATH="${PATH:-/bin:/usr/bin}:/mnt/app/armle/usr/bin:/mnt/app/armle/bin:/usr/bin:/bin"
-
-export RELEASE_VERSION=`/mnt/app/armle/usr/bin/pc b:46924065:401 | cut -c 61- | sed ':a;N;$!ba;s/\n//g' | sed -e 's/\.//g' | sed -e 's/ //g'`
-export OEM="$(echo $RELEASE_VERSION | cut -d'_' -f3 | cut -b -2)"
-
-# No OEM gate on uninstall: every step below only restores or removes files
-# this mod created (gal.real / dio_manager.real, our JAR, our cluster dir),
-# so it is safe on Porsche, Audi, or any unit where the mod was forced in.
-print "Head unit:         release=$RELEASE_VERSION oem=$OEM"
-
-JAR_DIR=/mnt/app/eso/hmi/lsd/jars
-CLUSTER_DIR=/mnt/app/eso/bin/apps/cluster
+. "$MOD_PATH/logging.sh"
+ci_log_init rollback || exit 1
+CI_CHECK=0; CI_SELFTEST=0
+case "${1:-}" in
+    '') [[ $# -eq 0 ]] || exit 2 ;;
+    --check) [[ $# -eq 1 ]] || exit 2; CI_CHECK=1 ;;
+    --self-test) [[ $# -eq 1 ]] || exit 2; CI_SELFTEST=1 ;;
+    *) ci_log 'ERROR unknown argument'; exit 2 ;;
+esac
 APPS_DIR=/mnt/app/eso/bin/apps
-
+JAR_DIR=/mnt/app/eso/hmi/lsd/jars
+CLUSTER_DIR="$APPS_DIR/cluster"
 BACKUP_DIR="$MOD_PATH/Backup"
-mkdir -p "$BACKUP_DIR" || { print -u2 "ERROR: cannot mkdir $BACKUP_DIR"; exit 2; }
-
-ts() { date +"%Y%m%d_%H%M%S"; }
-
+ci_run mkdir -p "$BACKUP_DIR" || exit 2
 MANIFEST="$BACKUP_DIR/manifest.txt"
-RUN_TS="$(ts)"
-note() { print "$RUN_TS $*" >> "$MANIFEST" 2>/dev/null; }
-note "run   uninstall $RELEASE_VERSION"
-
-is_wrapper_script() {
-    # Our wrappers start with "#!/bin/ksh"; the real binaries are ELF.
-    # dd is what the ModKit itself uses for this kind of check on QNX.
-    [[ -f "$1" ]] || return 1
-    [[ "$(dd if="$1" bs=1 count=10 2>/dev/null)" == "#!/bin/ksh" ]]
+note() { print -r -- "$CI_RUN_ID $*" >> "$MANIFEST"; }
+fail() { ci_log "ERROR $*"; CI_RESULT=FAILED; }
+. "$MOD_PATH/comparison.sh"
+ci_compare_init || { fail 'No working strong comparison; live files untouched'; exit 3; }
+[[ -f "$MOD_PATH/elf-magic.bin" ]] || { fail 'ELF header fixture missing'; exit 3; }
+same() {
+    ci_log "VERIFY_BYTES source=$1 destination=$2 tool=$CI_COMPARE_TOOL"
+    ci_compare "$1" "$2"
+    typeset rc=$?
+    ci_log "VERIFY_RESULT rc=$rc source=$1 destination=$2"
+    return "$rc"
 }
-
-print "Slaying running processes before uninstall..."
-for proc in cluster gal gal.real dio_manager dio_manager.real; do
-    slay -f "$proc" 2>/dev/null
-    if [[ $? -eq 0 ]]; then
-        print "slay:              $proc"
-    fi
-done
-print ""
-
-# Reverse of swap_binary_for_wrapper. If NAME.real exists, remove the
-# wrapper at NAME and move NAME.real -> NAME. If NAME.real doesn't exist,
-# nothing was swapped �� skip.
-restore_wrapped_binary() {
-    name="$1"
-    dst_active="$APPS_DIR/$name"
-    dst_real="$APPS_DIR/${name}.real"
-    sd_real_backup="$BACKUP_DIR/${name}.real"
-
-    if [[ ! -f "$dst_real" ]]; then
-        # Fallback: .real is gone but our wrapper is still in place and the
-        # SD card still holds the stable-name copy of the original binary.
-        if is_wrapper_script "$dst_active" && [[ -f "$sd_real_backup" ]]; then
-            bk="$BACKUP_DIR/${name}.wrapper.removed.$(ts)"
-            cp -p "$dst_active" "$bk" 2>/dev/null && print "backup wrapper:    $dst_active -> $bk"
-            cp -p "$sd_real_backup" "$dst_active" || { print -u2 "ERROR: restore from $sd_real_backup failed"; return 2; }
-            chmod 755 "$dst_active"
-            print "restore original:  $sd_real_backup -> $dst_active (from SD backup)"
-            note "restore $dst_active from=$sd_real_backup"
-            return 0
-        fi
-        if is_wrapper_script "$dst_active"; then
-            print -u2 "ERROR: $dst_active is our wrapper but neither $dst_real nor $sd_real_backup exists - cannot restore $name"
-            return 3
-        fi
-        print "skip restore:      $name (no $dst_real present)"
-        return 0
-    fi
-    if [[ -f "$dst_active" ]]; then
-        bk="$BACKUP_DIR/${name}.wrapper.removed.$(ts)"
-        cp -p "$dst_active" "$bk" 2>/dev/null && print "backup wrapper:    $dst_active -> $bk"
-        rm -f "$dst_active"
-    fi
-    mv "$dst_real" "$dst_active" || { print -u2 "ERROR: mv $name.real -> $name failed"; return 2; }
-    print "restore original:  $dst_real -> $dst_active"
-    note "restore $dst_active from=$dst_real"
+is_wrapper() { [[ -f "$1" && "$(dd if="$1" bs=1 count=10 2>/dev/null)" == '#!/bin/ksh' ]]; }
+is_elf() {
+    typeset stamp header
+    stamp=$(ci_stamp) || return 1
+    header="$CI_RUN_DIR/elf-header-$stamp.bin"
+    [[ -f "$MOD_PATH/elf-magic.bin" ]] || return 1
+    ci_run dd if="$1" of="$header" bs=1 count=4 || return 1
+    same "$header" "$MOD_PATH/elf-magic.bin"
 }
-
-backup_and_remove() {
-    f="$1"
-    if [[ ! -f "$f" ]]; then
-        print "skip absent:       $f"
-        return 0
-    fi
-    bk="$BACKUP_DIR/${f##*/}.removed.$(ts)"
-    cp -p "$f" "$bk" || { print -u2 "ERROR: backup failed: $f"; return 2; }
-    rm -f "$f"
-    print "remove:            $f -> $bk"
-    note "remove $f backup=$bk"
-}
-
-# need our .so files until processes restart, but removing them after the
-# restore is fine because next gal/dio_manager spawn won't use them). ──
-restore_wrapped_binary gal
-restore_wrapped_binary dio_manager
-
-backup_and_remove "$CLUSTER_DIR/cluster"
-backup_and_remove "$CLUSTER_DIR/gal_cluster.so"
-backup_and_remove "$CLUSTER_DIR/dio_cluster.so"
-backup_and_remove "$CLUSTER_DIR/cluster_config.json"
-[[ -f "$CLUSTER_DIR/diag_mode" ]] && rm -f "$CLUSTER_DIR/diag_mode" && print "remove:            $CLUSTER_DIR/diag_mode" && note "remove $CLUSTER_DIR/diag_mode"
-[[ -f "$CLUSTER_DIR/daemon_verbose" ]] && rm -f "$CLUSTER_DIR/daemon_verbose" && print "remove:            $CLUSTER_DIR/daemon_verbose" && note "remove $CLUSTER_DIR/daemon_verbose"
-
-typeset j
-for j in "$JAR_DIR"/ClusterIntegration_* "$JAR_DIR"/AndroidAutoCluster_*; do
-    [[ -f "$j" ]] && backup_and_remove "$j"
-done
-
-# Anything else the installer recorded as "add" under the mod's own
-# directories (future files this fixed list does not know about). Only
-# paths inside $CLUSTER_DIR or our jar name pattern are considered, so a
-# stale or edited manifest cannot make this remove stock files.
-if [[ -f "$MANIFEST" ]]; then
-    typeset addf
-    awk '$2 == "add" && !seen[$3]++ { print $3 }' "$MANIFEST" 2>/dev/null | while read -r addf; do
-        case "$addf" in
-            "$CLUSTER_DIR"/*|"$JAR_DIR"/ClusterIntegration_*)
-                [[ -f "$addf" ]] && backup_and_remove "$addf"
-                ;;
-        esac
+if [[ $CI_SELFTEST -eq 1 ]]; then
+    # These are non-executable ELF-magic fixtures, never run as programs.
+    BACKUP_DIR="$CI_RUN_DIR/sandbox-backups"; MANIFEST="$BACKUP_DIR/manifest.txt"
+    APPS_DIR="$CI_RUN_DIR/sandbox-root/apps"; JAR_DIR="$CI_RUN_DIR/sandbox-root/jars"
+    CLUSTER_DIR="$APPS_DIR/cluster"
+    ci_run mkdir -p "$BACKUP_DIR" "$CLUSTER_DIR" "$JAR_DIR" || exit 2
+    for name in gal dio_manager; do
+        ci_run cp "$MOD_PATH/selftest-original.bin" "$APPS_DIR/$name.real" || exit 2
+        print -r -- '#!/bin/ksh' > "$APPS_DIR/$name" || exit 2
     done
+    for name in cluster gal_cluster.so dio_cluster.so cluster_config.json diag_mode daemon_verbose gal_env; do
+        print -r -- 'sandbox mod file' > "$CLUSTER_DIR/$name" || exit 2
+    done
+    for name in ClusterIntegration_selftest.jar ClusterIntegration_StorageMountHandler_stub.jar AndroidAutoCluster_selftest.jar NaviCompass.jar AppDevelopment.jar; do
+        print -r -- "$name" > "$JAR_DIR/$name" || exit 2
+    done
+    ci_log "SELFTEST_SCOPE=$CI_RUN_DIR/sandbox-root synthetic_data=true"
 fi
-
-if [[ -d "$CLUSTER_DIR" ]] && [[ -z "$(ls -A "$CLUSTER_DIR" 2>/dev/null)" ]]; then
-    rmdir "$CLUSTER_DIR" 2>/dev/null && print "rmdir empty:       $CLUSTER_DIR"
+ORIGINAL=""
+choose_original() {
+    typeset name=$1
+    ORIGINAL=""
+    if [[ -f "$APPS_DIR/$name.real" ]]; then
+        ORIGINAL="$APPS_DIR/$name.real"
+    elif is_wrapper "$APPS_DIR/$name"; then
+        [[ -f "$BACKUP_DIR/$name.real" ]] || { fail "Cannot restore $name: .real and SD backup missing"; return 1; }
+        ORIGINAL="$BACKUP_DIR/$name.real"
+    else
+        ci_log "RESTORE_SKIP name=$name no_wrapper_or_saved_original"
+        return 0
+    fi
+    is_elf "$ORIGINAL" || { fail "Original $name ELF header check failed"; return 1; }
+    ci_log "RESTORE_PLAN name=$name source=$ORIGINAL destination=$APPS_DIR/$name"
+}
+choose_original gal || exit 3; GAL_SOURCE=$ORIGINAL
+choose_original dio_manager || exit 3; DIO_SOURCE=$ORIGINAL
+ci_log "PREFLIGHT_OK check=$CI_CHECK selftest=$CI_SELFTEST"
+if [[ $CI_CHECK -eq 1 ]]; then CI_RESULT=CHECK_OK; exit 0; fi
+if [[ $CI_SELFTEST -eq 0 ]]; then
+    [[ -d "$APPS_DIR" && -d "$JAR_DIR" ]] || { fail 'Application filesystem missing; no guessed device mount'; exit 3; }
+    ci_run mount -uw /mnt/app/ || { fail 'Application remount failed'; exit 3; }
 fi
-
-sync
-print ""
-print "Done."
-
+backup_file() {
+    typeset src=$1 stamp dst
+    stamp=$(ci_stamp) || return 1
+    dst="$BACKUP_DIR/${src##*/}.removed.$stamp"
+    ci_run cp -p "$src" "$dst" || return 1
+    same "$src" "$dst" || return 1
+    note "backup $src copy=$dst" || return 1
+}
+stage_original() {
+    typeset name=$1 original=$2 stage="$APPS_DIR/$1.mib2p-restore-stage"
+    [[ -n "$original" ]] || return 0
+    [[ ! -e "$stage" ]] || { fail "Existing stage retained: $stage"; return 1; }
+    [[ ! -f "$APPS_DIR/$name" ]] || backup_file "$APPS_DIR/$name" || return 1
+    ci_run cp -p "$original" "$stage" || return 1
+    same "$original" "$stage" || return 1
+    ci_run chmod 755 "$stage" || return 1
+    ci_log "STAGE_READY $stage"
+}
+# Both executables are staged and verified before any process is stopped.
+stage_original gal "$GAL_SOURCE" || { fail 'GAL staging failed; live files untouched'; exit 4; }
+stage_original dio_manager "$DIO_SOURCE" || { fail 'DIO staging failed; live files untouched'; exit 4; }
+if [[ $CI_SELFTEST -eq 0 ]]; then
+    ci_run slay -f cluster || ci_log 'PROCESS_ABSENT_OR_STOP_FAILED cluster'
+    if [[ -n "$GAL_SOURCE" ]]; then
+        ci_run slay -f gal || ci_log 'PROCESS_ABSENT_OR_STOP_FAILED gal'
+        ci_run slay -f gal.real || ci_log 'PROCESS_ABSENT_OR_STOP_FAILED gal.real'
+    fi
+    if [[ -n "$DIO_SOURCE" ]]; then
+        ci_run slay -f dio_manager || ci_log 'PROCESS_ABSENT_OR_STOP_FAILED dio_manager'
+        ci_run slay -f dio_manager.real || ci_log 'PROCESS_ABSENT_OR_STOP_FAILED dio_manager.real'
+    fi
+else
+    ci_log 'SELFTEST_SKIP mount and process signals'
+fi
+restore_binary() {
+    typeset name=$1 original=$2
+    [[ -n "$original" ]] || return 0
+    ci_run mv -f "$APPS_DIR/$name.mib2p-restore-stage" "$APPS_DIR/$name" || return 1
+    same "$original" "$APPS_DIR/$name" || return 1
+    # Keep the last good .real / SD backup, instead of consuming it with mv.
+    note "restore $APPS_DIR/$name from=$original" || return 1
+    ci_log "RESTORED_AND_VERIFIED $name"
+}
+restore_binary gal "$GAL_SOURCE" || { fail 'GAL restore failed; helpers retained'; exit 5; }
+restore_binary dio_manager "$DIO_SOURCE" || { fail 'DIO restore failed; helpers retained'; exit 5; }
+ERRORS=0
+remove_added() {
+    typeset f=$1
+    [[ -f "$f" ]] || { ci_log "REMOVE_SKIP absent=$f"; return 0; }
+    backup_file "$f" || { fail "Backup failed; retaining $f"; return 1; }
+    ci_run rm -f "$f" || return 1
+    [[ ! -e "$f" ]] || return 1
+    note "remove $f" || return 1
+    ci_log "REMOVED $f"
+}
+# Remove known mod files, then constrained future additions recorded below.
+for name in cluster gal_cluster.so dio_cluster.so cluster_config.json diag_mode daemon_verbose gal_env; do
+    remove_added "$CLUSTER_DIR/$name" || ERRORS=$((ERRORS + 1))
+done
+for jar in "$JAR_DIR"/ClusterIntegration_* "$JAR_DIR"/AndroidAutoCluster_*; do
+    [[ -f "$jar" ]] || continue
+    remove_added "$jar" || ERRORS=$((ERRORS + 1))
+done
+# Retain upstream's future-file cleanup, restricted to immediate children of
+# the mod directory. Reject traversal/subdirectories and never evaluate paths.
+if [[ -f "$MANIFEST" ]]; then
+    if ci_run cp "$MANIFEST" "$CI_RUN_DIR/manifest-before-cleanup.txt"; then
+        awk '$2 == "add" && !seen[$3]++ { print $3 }' "$CI_RUN_DIR/manifest-before-cleanup.txt" > "$CI_RUN_DIR/added-paths.txt" || ERRORS=$((ERRORS + 1))
+        while IFS= read -r added; do
+            case "$added" in
+                "$CLUSTER_DIR"/*)
+                    relative=${added#"$CLUSTER_DIR"/}
+                    case "$relative" in ''|.|..|*/*) ci_log "MANIFEST_PATH_REJECTED $added" ;;
+                        *) remove_added "$added" || ERRORS=$((ERRORS + 1)) ;;
+                    esac ;;
+                *) ci_log "MANIFEST_PATH_REJECTED $added" ;;
+            esac
+        done < "$CI_RUN_DIR/added-paths.txt"
+    else
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+if [[ -d "$CLUSTER_DIR" && -z "$(ls -A "$CLUSTER_DIR")" ]]; then
+    ci_run rmdir "$CLUSTER_DIR" || ERRORS=$((ERRORS + 1))
+fi
+ci_run sync || ERRORS=$((ERRORS + 1))
+if [[ $ERRORS -ne 0 ]]; then fail "ROLLBACK_ERRORS=$ERRORS"; exit 6; fi
+if [[ $CI_SELFTEST -eq 1 ]]; then
+    same "$APPS_DIR/gal.real" "$APPS_DIR/gal" || exit 6
+    same "$APPS_DIR/dio_manager.real" "$APPS_DIR/dio_manager" || exit 6
+    [[ ! -e "$CLUSTER_DIR/cluster" && ! -e "$JAR_DIR/ClusterIntegration_selftest.jar" ]] || exit 6
+    [[ -f "$JAR_DIR/NaviCompass.jar" && -f "$JAR_DIR/AppDevelopment.jar" ]] || exit 6
+    CI_RESULT=SELFTEST_OK
+else
+    CI_RESULT=ROLLBACK_OK
+fi
+ci_log 'UNINSTALL_COMPLETE no automatic reboot; restart MMI normally to reload Java'
+exit 0

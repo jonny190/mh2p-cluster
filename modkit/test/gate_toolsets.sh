@@ -17,7 +17,7 @@ mkjar() { # out.jar big? classes...   (central directory at the end, > 8 MB when
 setup() { # $1 release  $2 lsd.jar: none|aa|aa+sm  $3 jxe: none|aa|aa+sm  $4 markers
   rm -rf /mnt/app /fs /ifs; mkdir -p /mnt/app/armle/usr/bin /mnt/app/armle/bin /mnt/app/eso/hmi/lsd/jars /mnt/app/eso/bin/apps /mnt/app/eso/lib /ifs
   ln -sf /usr/bin/wc /mnt/app/armle/usr/bin/wc      # the unit keeps wc here, off the ModKit PATH
-  printf 'GALBIN\n' > /mnt/app/eso/bin/apps/gal; printf 'DIOBIN\n' > /mnt/app/eso/bin/apps/dio_manager; chmod 755 /mnt/app/eso/bin/apps/*
+  printf '\177ELFGALBIN\n' > /mnt/app/eso/bin/apps/gal; printf '\177ELFDIOBIN\n' > /mnt/app/eso/bin/apps/dio_manager; chmod 755 /mnt/app/eso/bin/apps/*
   printf '#!/bin/sh\nprintf "%%060d%%s\\n" 0 "'"$1"'"\n' > /mnt/app/armle/usr/bin/pc; chmod 755 /mnt/app/armle/usr/bin/pc
   # five small plugin jars like the unit's, none with the classes
   for j in AppDevelopment diag xEventRecorder xTcpKeyPanel xTcpLog; do mkjar /mnt/app/eso/hmi/lsd/jars/$j.jar 0 de/audi/plugins/$j/Plugin.class; done
@@ -66,8 +66,12 @@ echo "$out" | grep -q 'stand-in class:    OFF' && [[ ! -f $STUB ]] && res "B no_
 echo "$out" | grep -q "remove stand-in:   $STUB" && res "B removal logged" PASS || res "B removal logged" FAIL
 rm -f "$SCR/fakesd/Mods/ClusterIntegration/no_stub.txt"
 echo "=== C: uninstall removes everything incl. stub"
-run >/dev/null; out=$("$M" "$MOD_PATH/uninstall.sh" 2>&1)
-[[ ! -f $STUB && ! -f /mnt/app/eso/bin/apps/gal.real && "$(cat /mnt/app/eso/bin/apps/gal)" == "GALBIN" && -z "$(ls /mnt/app/eso/hmi/lsd/jars | grep ClusterIntegration)" ]] && res "C uninstall clean" PASS || res "C uninstall clean" FAIL
+run >/dev/null; out=$("$M" "$MOD_PATH/uninstall.sh" 2>&1); urc=$?
+if [[ $TS != audi_cmp ]]; then
+  [[ $urc == 3 && -f /mnt/app/eso/bin/apps/gal.real && -f /mnt/app/eso/bin/apps/cluster/cluster ]] && res "C no comparator: fail closed, live files retained" PASS || res "C no comparator rejection" FAIL
+else
+[[ ! -f $STUB && -f /mnt/app/eso/bin/apps/gal.real && "$(cat /mnt/app/eso/bin/apps/gal)" == $'\177ELFGALBIN' && -z "$(ls /mnt/app/eso/hmi/lsd/jars | grep ClusterIntegration)" ]] && res "C uninstall clean" PASS || res "C uninstall clean" FAIL
+fi
 echo "=== D: lsd.jar provides SM -> stub not needed (and removed if present)"
 setup MH2p_ER_AUG35_P2873 aa+sm aa+sm ""; touch $STUB; out=$(run)
 if echo "$out" | grep -q 'binary search:     none'; then
@@ -123,8 +127,13 @@ mksh /mnt/app/eso/bin/apps/gal 2>/dev/null | grep -q 'TOP=180 LOG=1 MERGE=unset'
 grep -q 'gal env: GAL_CLUSTER_LOG=1' /tmp/gal_preload.log && res "I wrapper logs the env lines" PASS || res "I wrapper logs env" FAIL
 rm -f "$SCR/fakesd/Mods/ClusterIntegration/gal_env.txt"; out=$(run)
 [[ ! -f $GE ]] && echo "$out" | grep -q 'remove gal env:' && res "I gal_env removed when gal_env.txt is gone" PASS || res "I gal_env removed" FAIL
+printf '\177ELFGALBIN\n' > /mnt/app/eso/bin/apps/gal.real
 printf 'GAL_CLUSTER_LOG=1\n' > "$SCR/fakesd/Mods/ClusterIntegration/gal_env.txt"; run >/dev/null; "$M" "$MOD_PATH/uninstall.sh" >/dev/null 2>&1
-[[ ! -f $GE && ! -d /mnt/app/eso/bin/apps/cluster ]] && res "I uninstall removes gal_env via manifest" PASS || res "I uninstall removes gal_env" FAIL
+if [[ $TS == audi_cmp ]]; then
+  [[ ! -f $GE && ! -d /mnt/app/eso/bin/apps/cluster ]] && res "I uninstall removes gal_env via manifest" PASS || res "I uninstall removes gal_env" FAIL
+else
+  [[ -f $GE ]] && res "I no comparator: gal_env retained" PASS || res "I no comparator: gal_env retention" FAIL
+fi
 printf 'on\n' > "$SCR/fakesd/Mods/ClusterIntegration/daemon_log.txt"; out=$(run)
 DV=/mnt/app/eso/bin/apps/cluster/daemon_verbose
 [[ -f $DV ]] && echo "$out" | grep -q 'daemon log:        ON' && res "I daemon_log.txt installs the daemon_verbose marker" PASS || res "I daemon_log.txt marker" FAIL

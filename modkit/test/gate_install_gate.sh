@@ -7,7 +7,7 @@ export PATH="$STUBS:$PATH"
 reset_tree() {
     rm -rf /mnt/app
     mkdir -p /mnt/app/armle/usr/bin /mnt/app/eso/hmi/lsd/jars /mnt/app/eso/bin/apps
-    printf 'GALBIN\n' > /mnt/app/eso/bin/apps/gal; printf 'DIOBIN\n' > /mnt/app/eso/bin/apps/dio_manager
+    printf '\177ELFGALBIN\n' > /mnt/app/eso/bin/apps/gal; printf '\177ELFDIOBIN\n' > /mnt/app/eso/bin/apps/dio_manager
     chmod 755 /mnt/app/eso/bin/apps/*
     printf '#!/bin/sh\nprintf "%%060d%%s\\n" 0 "$FAKE_RELEASE"\n' > /mnt/app/armle/usr/bin/pc; chmod 755 /mnt/app/armle/usr/bin/pc
     # stock HMI jar carrying the Porsche-side class the preflight looks for
@@ -42,24 +42,26 @@ echo "=== uninstall fallback: .real deleted, wrapper in place, SD backup present
 reset_tree; make_sd; export FAKE_RELEASE="MH2p_ER_AUG35_P2873"; mksh "$MOD_PATH/install.sh" >/dev/null 2>&1
 rm -f /mnt/app/eso/bin/apps/gal.real
 out=$(mksh "$MOD_PATH/uninstall.sh" 2>&1); rc=$?
-[[ "$(cat /mnt/app/eso/bin/apps/gal)" == "GALBIN" && ! -f /mnt/app/eso/bin/apps/gal.real && ! -f /mnt/app/eso/hmi/lsd/jars/ClusterIntegration_vTEST.jar && ! -f /mnt/app/eso/hmi/lsd/jars/ClusterIntegration_vTEST_aa.jar ]] && echo "fallback restore                   rc=$rc PASS" || echo "fallback restore                   rc=$rc FAIL"
+[[ "$(cat /mnt/app/eso/bin/apps/gal)" == $'\177ELFGALBIN' && ! -f /mnt/app/eso/bin/apps/gal.real && ! -f /mnt/app/eso/hmi/lsd/jars/ClusterIntegration_vTEST.jar && ! -f /mnt/app/eso/hmi/lsd/jars/ClusterIntegration_vTEST_aa.jar ]] && echo "fallback restore                   rc=$rc PASS" || echo "fallback restore                   rc=$rc FAIL"
 echo "$out" | grep -E "restore original|ERROR|skip restore" | sed 's/^/    | /'
 
 echo "=== uninstall with wrapper but no backups anywhere -> ERROR, wrapper left untouched ==="
 reset_tree; make_sd; mksh "$MOD_PATH/install.sh" >/dev/null 2>&1
 rm -f /mnt/app/eso/bin/apps/gal.real "$MOD_PATH/Backup/gal.real"
 out=$(mksh "$MOD_PATH/uninstall.sh" 2>&1); rc=$?
-head -1 /mnt/app/eso/bin/apps/gal | grep -q '#!/bin/ksh' && echo "$out" | grep -q "cannot restore gal" && echo "no-backup error path               PASS" || echo "no-backup error path               FAIL"
+log=$(ls -td "$SCR/fakesd/Logs/ClusterIntegration"/rollback-* | head -1)/commands.log
+head -1 /mnt/app/eso/bin/apps/gal | grep -q '#!/bin/ksh' && [[ $rc -ne 0 ]] && grep -qi "cannot restore gal" "$log" && echo "no-backup error path               PASS" || echo "no-backup error path               FAIL"
 echo "$out" | grep -E "ERROR" | sed 's/^/    | /'
 
 echo "=== rollback.sh (no MOD_PATH in env) ==="
 reset_tree; make_sd; mksh "$MOD_PATH/install.sh" >/dev/null 2>&1
+sed -i "s|exec /bin/ksh |exec $(command -v mksh) |" "$SCR/fakesd/Mods/ClusterIntegration/Update/rollback.sh"
 ( unset MOD_PATH; cd /; out=$(mksh "$SCR/fakesd/Mods/ClusterIntegration/Update/rollback.sh" 2>&1); rc=$?
-  [[ "$(cat /mnt/app/eso/bin/apps/gal)" == "GALBIN" && "$(cat /mnt/app/eso/bin/apps/dio_manager)" == "DIOBIN" && ! -f /mnt/app/eso/hmi/lsd/jars/ClusterIntegration_vTEST.jar && ! -d /mnt/app/eso/bin/apps/cluster ]] && echo "rollback.sh                        rc=$rc PASS" || echo "rollback.sh                        rc=$rc FAIL"
+  [[ "$(cat /mnt/app/eso/bin/apps/gal)" == $'\177ELFGALBIN' && "$(cat /mnt/app/eso/bin/apps/dio_manager)" == $'\177ELFDIOBIN' && ! -f /mnt/app/eso/hmi/lsd/jars/ClusterIntegration_vTEST.jar && ! -d /mnt/app/eso/bin/apps/cluster ]] && echo "rollback.sh                        rc=$rc PASS" || echo "rollback.sh                        rc=$rc FAIL"
   echo "$out" | grep -E "Head unit|restore original|remove:|rmdir" | sed 's/^/    | /' )
 echo "=== manifest tail ==="; tail -6 "$MOD_PATH/Backup/manifest.txt" | sed 's/^/    | /'
 
 echo "=== re-install after rollback (fresh .real, idempotent) ==="
 out=$(mksh "$MOD_PATH/install.sh" 2>&1); mksh "$MOD_PATH/install.sh" 2>&1 | grep -c "skip identical" | sed 's/^/    | skip-identical on 2nd run: /'
-[[ "$(cat /mnt/app/eso/bin/apps/gal.real)" == "GALBIN" ]] && echo "re-install preserves original      PASS" || echo "re-install preserves original      FAIL"
+[[ "$(cat /mnt/app/eso/bin/apps/gal.real)" == $'\177ELFGALBIN' ]] && echo "re-install preserves original      PASS" || echo "re-install preserves original      FAIL"
 rm -rf /mnt/app

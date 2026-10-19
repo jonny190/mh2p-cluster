@@ -1,0 +1,2 @@
+# Recovery comparison fixtures must remain byte-exact across checkouts.
+modkit/Mods/ClusterIntegration/Update/*.bin binary

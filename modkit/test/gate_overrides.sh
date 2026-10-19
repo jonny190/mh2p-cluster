@@ -4,7 +4,7 @@ SCR="$1"; REPO="$2"; export PATH="$SCR/stubs:$PATH"
 SYMS_SO=$SCR/zip34/Mods/ClusterIntegration/Update/gal_cluster.so
 setup() { # $1 release, $2 with_sportchrono, $3 with_aa_jar
   rm -rf /mnt/app /fs; mkdir -p /mnt/app/armle/usr/bin /mnt/app/eso/hmi/lsd/jars /mnt/app/eso/bin/apps /mnt/app/eso/lib
-  printf 'GALBIN\n' > /mnt/app/eso/bin/apps/gal; printf 'DIOBIN\n' > /mnt/app/eso/bin/apps/dio_manager; chmod 755 /mnt/app/eso/bin/apps/*
+  printf '\177ELFGALBIN\n' > /mnt/app/eso/bin/apps/gal; printf '\177ELFDIOBIN\n' > /mnt/app/eso/bin/apps/dio_manager; chmod 755 /mnt/app/eso/bin/apps/*
   printf '#!/bin/sh\nprintf "%%060d%%s\\n" 0 "'"$1"'"\n' > /mnt/app/armle/usr/bin/pc; chmod 755 /mnt/app/armle/usr/bin/pc
   rm -rf $SCR/fakejars && mkdir -p $SCR/fakejars/de/audi/app/terminalmode/smartphone/androidauto2 $SCR/fakejars/de/audi/app/car/adi/legacy/sportchrono
   echo x > $SCR/fakejars/de/audi/app/terminalmode/smartphone/androidauto2/AndroidAuto2Subsystem.class
@@ -45,7 +45,10 @@ echo "=== diag + overrides via apply_override ==="; touch "$SCR/fakesd/Mods/Clus
 python3 -c "import json;c=json.load(open('$CFG'))['config'];print(('PASS' if c['enableMapRender'] is False and c['forceRHD'] is True else 'FAIL')+' diag: enableMapRender=false, forceRHD kept')"
 rm -f "$SCR/fakesd/Mods/ClusterIntegration/diag.txt"
 echo "=== manifest-driven cleanup of an extra 'add' ==="; echo "extra" > /mnt/app/eso/bin/apps/cluster/extra_future_file; echo "20260101_000000 add /mnt/app/eso/bin/apps/cluster/extra_future_file" >> "$MOD_PATH/Backup/manifest.txt"; echo "20260101_000000 add /mnt/app/eso/bin/apps/gal" >> "$MOD_PATH/Backup/manifest.txt"
-out=$(mksh "$MOD_PATH/uninstall.sh" 2>&1); [[ ! -f /mnt/app/eso/bin/apps/cluster/extra_future_file && ! -d /mnt/app/eso/bin/apps/cluster && "$(cat /mnt/app/eso/bin/apps/gal)" == "GALBIN" ]] && res "manifest add cleanup (own dirs only)" PASS || res "manifest add cleanup (own dirs only)" FAIL
+echo "keep" > /mnt/app/eso/bin/apps/manifest-sentinel
+echo "20260101_000000 add /mnt/app/eso/bin/apps/cluster/../manifest-sentinel" >> "$MOD_PATH/Backup/manifest.txt"
+out=$(mksh "$MOD_PATH/uninstall.sh" 2>&1); [[ ! -f /mnt/app/eso/bin/apps/cluster/extra_future_file && ! -d /mnt/app/eso/bin/apps/cluster && "$(cat /mnt/app/eso/bin/apps/gal)" == $'\177ELFGALBIN' ]] && res "manifest add cleanup (own dirs only)" PASS || res "manifest add cleanup (own dirs only)" FAIL
+[[ -f /mnt/app/eso/bin/apps/manifest-sentinel ]] && res "manifest traversal rejected" PASS || res "manifest traversal rejected" FAIL
 echo "=== aa_only jar missing on Audi -> abort before change ==="; setup MH2p_ER_AUG35_P2873 1 0; out=$(mksh "$MOD_PATH/install.sh" 2>&1); rc=$?; echo "$out" | grep -E "ERROR" | sed 's/^/    | /'; [[ $rc == 4 && ! -f /mnt/app/eso/bin/apps/gal.real && -z "$(ls /mnt/app/eso/hmi/lsd/jars | grep ClusterIntegration)" ]] && res "abort without aa_only jar" PASS || res "abort without aa_only jar" FAIL
 touch "$SCR/fakesd/Mods/ClusterIntegration/enable_carplay.txt"; out=$(mksh "$MOD_PATH/install.sh" 2>&1); [[ -f /mnt/app/eso/hmi/lsd/jars/ClusterIntegration_vTEST.jar ]] && res "enable_carplay.txt allows full jar" PASS || res "enable_carplay.txt allows full jar" FAIL
 echo "=== wrappers: no SD-root marker any more ==="; mkdir -p /fs/sda0; touch /fs/sda0/cluster_diag.txt; printf '#!/bin/sh\necho "MERGE=$GAL_CLUSTER_MERGE"\n' > /mnt/app/eso/bin/apps/gal.real; chmod 755 /mnt/app/eso/bin/apps/gal.real; mksh /mnt/app/eso/bin/apps/gal 2>/dev/null | grep -q "MERGE=$" && res "root marker ignored" PASS || res "root marker ignored" FAIL; rm -rf /fs

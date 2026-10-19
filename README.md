@@ -338,11 +338,18 @@ Everything else the mod installs (the JAR, the Audi stand-in jar, `cluster`, the
 
 To roll back:
 
-- **With the ModKit:** put an empty `uninstall.txt` in `Mods/ClusterIntegration/` on the SD card and boot with it inserted. `uninstall.sh` restores `gal` and `dio_manager` from their `.real` originals (falling back to `Backup/*.real` on the card if `.real` is missing), removes the added files (backing each one up as `*.removed.<timestamp>`), and records what it did in the manifest.
+- **With the ModKit:** put an empty `uninstall.txt` in `Mods/ClusterIntegration/` on the SD card and boot with it inserted. `uninstall.sh` restores `gal` and `dio_manager` from their `.real` originals (falling back to `Backup/*.real` on the card if `.real` is missing), removes the added files (backing each one up as `*.removed.<run-id>`), and records what it did in the manifest.
 - **Over SSH:** `ksh /fs/sda0/Mods/ClusterIntegration/Update/rollback.sh` does the same without a reboot cycle (the card may be on `/fs/sdb0` or `/fs/usb0_0` on your unit).
 - **Boot loop or dead Android Auto:** the ModKit runs a `failsafe.sh` from the root of the SD card early in every boot. A ready-made one ships as `Mods/ClusterIntegration/failsafe.sh` (inert there); copy it to the card's root, boot once with the card in, then delete it from the root again or it rolls back on every boot. Output goes to `Logs/ClusterIntegration-failsafe.log`.
 
-Keep the SD card: it is the only place the timestamped history lives. A factory firmware update rewrites `/mnt/app` and removes the mod along with the `.real` files anyway.
+**Recovery scripts in this source tree:** the uninstaller now verifies backups
+and staged replacements, keeps `.real` originals, and uses numbered backup/log
+IDs rather than formatted dates. `--check` and an isolated `--self-test` are
+available; see [verified recovery](modkit/RECOVERY.md) for commands, comparison
+tool requirements and limitations. Existing release ZIPs need rebuilding to
+include these script changes.
+
+Keep the SD card: it is the only place the backup history lives. A factory firmware update rewrites `/mnt/app` and removes the mod along with the `.real` files anyway.
 
 ---
 
