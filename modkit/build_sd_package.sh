@@ -9,9 +9,10 @@
 # cluster_config.json). Only Mods/ is unsigned and unchecksummed, so this is
 # the safe place to change install behaviour without a QNX toolchain.
 #
-# It also derives an Android-Auto-only JAR (Update/aa_only/<name>_aa.jar,
-# without the CarPlay classes) that install.sh prefers on Audi unless
-# enable_carplay.txt is present. The Audi stand-in jar for the Porsche-only
+# It also derives an Audi JAR (Update/aa_only/<name>_aa.jar) that install.sh
+# uses on Audi unless enable_carplay.txt is present: the release JAR without
+# the CarPlay DSI manager classes, but with the CarPlay cluster integration,
+# which AndroidAuto2Subsystem starts there. The Audi stand-in jar for the Porsche-only
 # StorageMountHandler class (Update/audi/, built by modkit/stub/build_stub.sh)
 # is tracked under modkit/Mods and copied in with the overlay.
 #
@@ -103,6 +104,12 @@ import os, sys, zipfile
 upd = sys.argv[1]
 DROP_PREFIX = "de/audi/app/terminalmode/smartphone/carplay/"
 DROP_EXACT = set()
+# Kept from the carplay package: the cluster integration itself (BAP bridge,
+# PPS reader, DSI listener) and its two helpers. They reference only
+# framework classes that the Audi image has too (verified with javap against
+# an A6 C8 P2711 lsd.jar); AndroidAuto2Subsystem starts them on Audi so the
+# stock CarPlayDSIManager stays untouched.
+KEEP_CARPLAY = ("CarPlayClusterIntegration", "CarPlayManeuverMapper", "CarPlaySideStreets")
 out_dir = os.path.join(upd, "aa_only")
 os.makedirs(out_dir, exist_ok=True)
 # A tracked aa_only jar may have been overlaid from modkit/Mods; drop any
@@ -121,7 +128,9 @@ for name in sorted(os.listdir(upd)):
     kept = dropped = 0
     with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
-            if info.filename.startswith(DROP_PREFIX) or info.filename in DROP_EXACT:
+            base = info.filename[len(DROP_PREFIX):] if info.filename.startswith(DROP_PREFIX) else None
+            keep = base is not None and base.split("$")[0].split(".")[0] in KEEP_CARPLAY
+            if (info.filename.startswith(DROP_PREFIX) and not keep) or info.filename in DROP_EXACT:
                 dropped += 1
                 continue
             zout.writestr(info, zin.read(info))
@@ -165,6 +174,27 @@ if [[ -f "$CLUSTER_PATCHES" ]]; then
     python3 "$HERE/patches/apply_patches.py" "$CLUSTER_BIN" "$CLUSTER_PATCHES" "$WORK/cluster.bytepatched" | sed 's/^/  patches: /'
     cp "$WORK/cluster.bytepatched" "$CLUSTER_BIN" && chmod 755 "$CLUSTER_BIN"
 fi
+
+# Optional extra daemon patches, opt-in per build (space-separated list), e.g.
+# CLUSTER_EXTRA_PATCHES=modkit/patches/cluster.box.patches.txt for the
+# centred mirror box on Audi MH2p. Same verification as above.
+for extra in ${CLUSTER_EXTRA_PATCHES:-}; do
+    [[ -f "$extra" ]] || { echo "error: CLUSTER_EXTRA_PATCHES file not found: $extra" >&2; exit 1; }
+    CLUSTER_BIN="$PKG/Mods/ClusterIntegration/Update/cluster"
+    python3 "$HERE/patches/apply_patches.py" "$CLUSTER_BIN" "$extra" "$WORK/cluster.extra" | sed 's/^/  patches: /'
+    cp "$WORK/cluster.extra" "$CLUSTER_BIN" && chmod 755 "$CLUSTER_BIN"
+done
+
+# Daemon for the Audi JAR. That JAR's DisplayManagerMIB2High shows the video
+# on displayable 62 (cluster contexts 80/81) instead of Audi's map
+# displayable 33, so the daemon next to it must post its window there
+# (modkit/patches/cluster.disp62.patches.txt). install.sh installs
+# Update/aa_only/cluster whenever it installs the Audi JAR; Porsche and the
+# full JAR keep Update/cluster on 33.
+DISP62_PATCHES="$HERE/patches/cluster.disp62.patches.txt"
+python3 "$HERE/patches/apply_patches.py" "$PKG/Mods/ClusterIntegration/Update/cluster" "$DISP62_PATCHES" \
+    "$PKG/Mods/ClusterIntegration/Update/aa_only/cluster" | sed 's/^/  disp62:  /'
+chmod 755 "$PKG/Mods/ClusterIntegration/Update/aa_only/cluster"
 
 # Cluster display entry offered to the phone. With modkit/template/template.txt
 # present (or TEMPLATE_TXT=<file>), the 54-byte entry inside gal_cluster.so is

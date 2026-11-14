@@ -18,7 +18,7 @@ make_sd() {
     rm -rf "$SCR/fakesd"; mkdir -p "$SCR/fakesd/Mods/ClusterIntegration"
     cp -r "$REPO/modkit/Mods/ClusterIntegration/Update" "$SCR/fakesd/Mods/ClusterIntegration/"
     for f in ClusterIntegration_vTEST.jar cluster gal_cluster.so dio_cluster.so cluster_config.json; do printf 'payload %s\n' "$f" > "$SCR/fakesd/Mods/ClusterIntegration/Update/$f"; done
-    mkdir -p "$SCR/fakesd/Mods/ClusterIntegration/Update/aa_only"; printf 'payload aa jar\n' > "$SCR/fakesd/Mods/ClusterIntegration/Update/aa_only/ClusterIntegration_vTEST_aa.jar"
+    mkdir -p "$SCR/fakesd/Mods/ClusterIntegration/Update/aa_only"; printf 'payload aa jar\n' > "$SCR/fakesd/Mods/ClusterIntegration/Update/aa_only/ClusterIntegration_vTEST_aa.jar"; printf 'payload aa cluster\n' > "$SCR/fakesd/Mods/ClusterIntegration/Update/aa_only/cluster"
 }
 export MOD_PATH="$SCR/fakesd/Mods/ClusterIntegration/Update"
 gate_case() { # name release force expect

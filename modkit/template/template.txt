@@ -4,15 +4,26 @@
 # codecRes=1080 (1920x1080); '#' starts a comment. Keys not listed keep the
 # tool's defaults. Remove this file to ship the hook as released.
 #
-# These are the Q7 (P2711) values from PR #11, verified on the same 1920x722
-# cockpit, used on the e-tron with gal_h264.panY=0 (centred crop, frame rows
-# 179..900): the phone keeps its UI inside those rows and out of the Audi
-# info bar (inset_bottom) and the curved housing (inset_left/right).
+# Margins and bottom inset are the Q7 (P2711) values from PR #11, verified on
+# the same 1920x722 cockpit, used with gal_h264.panY=0 (centred crop, frame
+# rows 179..900): the phone keeps its UI inside those rows and out of the
+# Audi info bar (inset_bottom).
+#
+# Side insets and density were chosen on an A6 C8 (P2711) with Google Maps:
+# - left/right 160 (Q7): the turn card sits flush right behind the speed
+#   dial; its ETA line is cut in the large map view and the whole card is
+#   hidden in the view with the two large dials (also reported on an e-tron).
+# - 500/500: clear of the dial in the large map view, still cut in the
+#   large-dial view, where only about x 616..1304 is visible.
+# - 624/624: Google Maps drops the turn card (too little room left).
+# - 500/624 with density 160: the card (about 336 px wide) ends at x 1296
+#   and is fully visible in both views. Android Auto gets these values once
+#   per connection, so one entry has to serve both cockpit views.
 height_margin=358
 margin_top=179
 margin_bottom=180
 inset_bottom=195
-inset_left=160
-inset_right=160
-density=200
+inset_left=500
+inset_right=624
+density=160
 real_density=200

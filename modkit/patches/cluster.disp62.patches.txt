@@ -1,0 +1,16 @@
+# Byte patch for Update/cluster (v0034 beta2 candidate 90d0b76, also on top of
+# cluster.patches.txt and cluster.box.patches.txt), applied with
+# modkit/patches/apply_patches.py. Format:
+#   <offset> <expected bytes> <new bytes>  # comment
+#
+# Cluster video on its own displayable (A6 C8 P2711, 2026-10-26). Every
+# window the daemon creates (h264 decoder in cb_begin_sequence, screen mirror
+# in main, run_test_mode, run_idle_logo, run_canim_splash) takes its
+# displayable from the one rodata string "33" (file 0x14c10, VA 0x0805cc10,
+# five literal-pool references, each passed to
+# screen_set_window_property_cv(win, SCREEN_PROPERTY_ID_STRING, 2, "33")).
+# Posting into 33 took Audi's map displayable over, and the map never came
+# back after the video. "62" is a displayable of its own that the mod's
+# DisplayManagerMIB2High puts into the cluster contexts 80/81 while the video
+# runs. Needs that class in the jar; without it the video is not shown.
+0x14c10  3333  3632  # window ID string "33" -> "62"

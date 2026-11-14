@@ -14,6 +14,7 @@
 # phone honours are built into that entry by modkit/template/template.txt
 # when the package is built; see the README's "Fitting the map" section.
 #
-# The stream size asked from the phone (480, 720 or 1080); the e-tron uses
-# 1080 so the 1920-wide frame maps 1:1 onto the panel.
+# The stream size asked from the phone (480, 720 or 1080). On Audi the
+# installer sets 1080 by itself, so the 1920-wide frame maps 1:1 onto the
+# panel; a line here overrides that.
 #GAL_CLUSTER_RES=1080

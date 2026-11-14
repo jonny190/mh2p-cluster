@@ -367,7 +367,91 @@ IDSIControllerStateListener {
         this.stateHandler = iStateHandler;
         this.logger.log(1000000, "[%1.<init>] AndroidAutoClusterIntegration registered with listener distributor", (Object)LOGCLASS);
         // Hide the native cockpit map while the AA cluster video renders (Audi Q7 P2711).
-        KombiMapGuard.start(iContext, this.clusterIntegration);
+        // CarPlay on Audi: start the CarPlay cluster integration from here instead
+        // of shadowing CarPlayDSIManager, whose Audi build differs from the Porsche
+        // copy. It only needs the service registry and a DSI listener slot. The
+        // guard watches both integrations, so the native cockpit map is hidden
+        // while the CarPlay mirror renders and handed back afterwards.
+        Object cp = startCarPlayClusterIntegration(iContext, logChannel);
+        KombiMapGuard.start(iContext, this.clusterIntegration, cp);
+    }
+
+    /**
+     * Starts CarPlayClusterIntegration (BAP turn-by-turn fed by the dio_manager
+     * hook over the PPS bridge) without replacing the stock CarPlayDSIManager.
+     * Mirrors what the mod's CarPlayDSIManager.init() does on Porsche. Every
+     * step is guarded: a failure here must never take Android Auto down.
+     */
+    private static Object startCarPlayClusterIntegration(IContext iContext, LogChannel logChannel) {
+        de.audi.app.terminalmode.smartphone.carplay.CarPlayClusterIntegration cp;
+        try {
+            cp = new de.audi.app.terminalmode.smartphone.carplay.CarPlayClusterIntegration();
+            cp.loadConfig();
+        } catch (Throwable t) {
+            logChannel.log(100000, "[%1.<init>] CarPlayClusterIntegration not started: %2", (Object)LOGCLASS, (Object)t.toString());
+            return null;
+        }
+        try {
+            ServiceReference[] refs = iContext.getServiceManager().getServiceReferences(CombiBAPServiceNavi.class);
+            if (refs != null && refs.length > 0) {
+                CombiBAPServiceNavi svc = (CombiBAPServiceNavi) iContext.getServiceManager().getService(refs[0]);
+                if (svc != null) cp.setClusterService(svc);
+            }
+        } catch (Exception e) {
+            logChannel.log(100000, "[%1.<init>] CarPlay: CombiBAPServiceNavi lookup failed: %2", (Object)LOGCLASS, (Object)e.toString());
+        }
+        try {
+            ServiceReference[] refs = iContext.getServiceManager().getServiceReferences(ISysServices.class);
+            if (refs != null && refs.length > 0) {
+                ISysServices svc = (ISysServices) iContext.getServiceManager().getService(refs[0]);
+                if (svc != null) cp.setSysServices(svc);
+            }
+        } catch (Exception e) {
+            logChannel.log(100000, "[%1.<init>] CarPlay: ISysServices lookup failed: %2", (Object)LOGCLASS, (Object)e.toString());
+        }
+        try {
+            ServiceReference[] refs = iContext.getServiceManager().getServiceReferences(ICarCoreServices.class);
+            if (refs != null && refs.length > 0) {
+                ICarCoreServices svc = (ICarCoreServices) iContext.getServiceManager().getService(refs[0]);
+                if (svc != null) cp.setCarCoreServices(svc);
+            }
+        } catch (Exception e) {
+            logChannel.log(100000, "[%1.<init>] CarPlay: ICarCoreServices lookup failed: %2", (Object)LOGCLASS, (Object)e.toString());
+        }
+        try {
+            ServiceReference[] refs = iContext.getServiceManager().getServiceReferences(ICarExteriorLightService.class);
+            if (refs != null && refs.length > 0) {
+                ICarExteriorLightService svc = (ICarExteriorLightService) iContext.getServiceManager().getService(refs[0]);
+                if (svc != null) cp.setExteriorLightService(svc);
+            }
+        } catch (Exception e) {
+            logChannel.log(100000, "[%1.<init>] CarPlay: ICarExteriorLightService lookup failed: %2", (Object)LOGCLASS, (Object)e.toString());
+        }
+        try {
+            ServiceReference[] refs = iContext.getServiceManager().getServiceReferences(de.audi.atip.interapp.combi.bap.PartialPopupBAPService.class);
+            if (refs != null && refs.length > 0) {
+                de.audi.atip.interapp.combi.bap.PartialPopupBAPService svc = (de.audi.atip.interapp.combi.bap.PartialPopupBAPService) iContext.getServiceManager().getService(refs[0]);
+                if (svc != null) cp.setPopupService(svc);
+            }
+        } catch (Exception e) {
+            logChannel.log(100000, "[%1.<init>] CarPlay: PartialPopupBAPService lookup failed: %2", (Object)LOGCLASS, (Object)e.toString());
+        }
+        try {
+            cp.init();
+            iContext.getServiceManager().registerDSIListener(0, "org.dsi.ifc.carplay.DSICarplayListener", cp);
+            cp.logCluster("DSI: registerDSIListener OK (started from AndroidAuto2Subsystem)");
+            // On Audi the main-screen handover arrives as responseModeChange;
+            // the bridge feeds its resource list into the integration.
+            de.audi.app.terminalmode.smartphone.androidauto2.nav.CarPlayScreenBridge bridge =
+                    new de.audi.app.terminalmode.smartphone.androidauto2.nav.CarPlayScreenBridge(cp);
+            iContext.getServiceManager().registerDSIListener(0, "org.dsi.ifc.carplay.DSICarplayListener", bridge);
+            bridge.subscribe(iContext);
+            cp.logCluster("DSI: screen bridge registered");
+            logChannel.log(1000000, "[%1.<init>] CarPlayClusterIntegration registered", (Object)LOGCLASS);
+        } catch (Throwable t) {
+            logChannel.log(100000, "[%1.<init>] CarPlayClusterIntegration init/register failed: %2", (Object)LOGCLASS, (Object)t.toString());
+        }
+        return cp;
     }
 
     public void init() {

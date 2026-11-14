@@ -18,6 +18,19 @@
 #     diag.txt            hook logs only, no cluster service injected,
 #                         installed config set to turn-by-turn only
 #     enable_carplay.txt  install the CarPlay hook and full JAR on Audi
+#     enable_carplay_hook.txt  Audi: install the CarPlay hook (dio_manager
+#                         wrapper + dio_cluster.so) but keep the Audi JAR; the
+#                         CarPlay cluster integration is started from
+#                         AndroidAuto2Subsystem, the stock CarPlayDSIManager
+#                         keeps running CarPlay
+#     enable_carplay_altscreen.txt  Audi: CarPlay map video in the cockpit
+#                         (the iPhone's instrument-cluster stream, "altScreen"):
+#                         installs altscreen.so, preloaded into dio_manager
+#                         instead of dio_cluster.so, and altscreen_pf.sh, which
+#                         the Persist script starts to open TCP 6031 in Audi's
+#                         packet filter; sets mirror.mode "fill capture=h264".
+#                         Built for libairplay 320.17.1 (MH2p_ER_AUG35_P2711);
+#                         on any other build the hook passes everything through
 #     config_overrides.txt  key=value lines applied to the installed
 #                         cluster_config.json "config" block (e.g. forceRHD=true)
 #     no_stub.txt         Audi: do not install the StorageMountHandler stand-in
@@ -153,7 +166,15 @@ files_identical() {
 
 # ex: MH2p_US_PO416_P2870 (Porsche), MH2p_ER_AUG35_P2873 (Audi e-tron),
 #     MH2p_ER_AU_P2873 (Audi units without a TYPE code, e.g. Q3/A1)
-export RELEASE_VERSION=`/mnt/app/armle/usr/bin/pc b:46924065:401 | cut -c 61- | sed ':a;N;$!ba;s/\n//g' | sed -e 's/\.//g' | sed -e 's/ //g'`
+# The ModKit exports RELEASE_VERSION (same pc call) before running this
+# script; use it when present. Run by hand over SSH, pc needs the HMI's
+# library path and working directory and aborts without them, so a value
+# set by the caller (export RELEASE_VERSION=MH2p_...) is taken as is.
+if [[ -z "${RELEASE_VERSION:-}" ]]; then
+    export RELEASE_VERSION=`/mnt/app/armle/usr/bin/pc b:46924065:401 2>/dev/null | cut -c 61- | sed ':a;N;$!ba;s/\n//g' | sed -e 's/\.//g' | sed -e 's/ //g'`
+else
+    export RELEASE_VERSION
+fi
 # AS, CN, ER, US, ...
 export REGION="$(echo $RELEASE_VERSION | cut -d'_' -f2)"
 # VW, AU, PO, LB, ...
@@ -209,11 +230,18 @@ case "$OEM" in
         else
             print "$brand firmware $RELEASE_VERSION OK, installing..."
         fi
-        if [[ "$OEM" == "AU" ]]; then
+        if [[ "$OEM" == "AU" && "$SOFTWARE_VERSION" == 2711 && -e "$MOD_ROOT/enable_carplay_altscreen.txt" ]]; then
+            # The CarPlay cockpit map (altScreen) was built and tested on
+            # P2711 (A6 C8, EU and US units); the Porsche-window warning below
+            # is about the Android Auto hooks and only confused its users.
+            print "Audi P2711 with the CarPlay cockpit map: the build it was made and tested on (A6 C8, EU and US). Still a beta."
+        elif [[ "$OEM" == "AU" ]]; then
             print "Audi support is EXPERIMENTAL: the JAR and native hooks were built against Porsche PCM5."
             if [[ "$SOFTWARE_VERSION" != 28?? ]]; then
                 print "WARNING: Audi build $SOFTWARE_VERSION is outside the 28xx window the hooks were built against (P2873 is the closest known match). Run the diagnostic pass first."
             fi
+        fi
+        if [[ "$OEM" == "AU" ]]; then
             print "If Android Auto or CarPlay stop working: put uninstall.txt in Mods/ClusterIntegration/ and re-run the ModKit."
         fi
         ;;
@@ -247,12 +275,20 @@ if [[ ! -f "$APPS_DIR/gal" && ! -f "$APPS_DIR/gal.real" ]]; then
     print "WARN: $APPS_DIR/gal not found. Android Auto cluster video hook cannot be installed on this unit; BAP turn-by-turn (JAR) will still be installed."
 fi
 
-# CarPlay is opt-in on Audi (enable_carplay.txt). Without it the Android-
-# Auto-only JAR from aa_only/ is required; refuse to fall back to the full
-# JAR, which would shadow Audi's CarPlay DSI manager.
+# CarPlay on Audi: two independent opt-ins. enable_carplay.txt installs the
+# full JAR (shadows Audi's CarPlayDSIManager with the Porsche copy; known not
+# to link on P2873) and the dio_manager hook. enable_carplay_hook.txt installs
+# only the hook and keeps the Audi JAR from aa_only/, whose
+# AndroidAuto2Subsystem starts the CarPlay cluster integration itself.
+# Without either marker the Audi JAR is required; refuse to fall back to the
+# full JAR.
 CARPLAY_HOOK=1
-[[ "$OEM" == "AU" && ! -e "$MOD_ROOT/enable_carplay.txt" ]] && CARPLAY_HOOK=0
-if [[ $CARPLAY_HOOK -eq 0 ]]; then
+FULL_JAR=1
+if [[ "$OEM" == "AU" ]]; then
+    [[ -e "$MOD_ROOT/enable_carplay.txt" ]] || FULL_JAR=0
+    [[ -e "$MOD_ROOT/enable_carplay.txt" || -e "$MOD_ROOT/enable_carplay_hook.txt" ]] || CARPLAY_HOOK=0
+fi
+if [[ $FULL_JAR -eq 0 ]]; then
     AA_JAR="$(ls -1t "$MOD_PATH"/aa_only/ClusterIntegration_*_aa.jar 2>/dev/null | head -1)"
     if [[ -z "$AA_JAR" || ! -f "$AA_JAR" ]]; then
         print -u2 "ERROR: $MOD_PATH/aa_only/ClusterIntegration_*_aa.jar not found. Aborting before any change."
@@ -260,6 +296,33 @@ if [[ $CARPLAY_HOOK -eq 0 ]]; then
         print -u2 "       package is used with only the scripts copied over it. Extract the Audi zip to an empty card (or copy the whole"
         print -u2 "       modkit/Mods/ClusterIntegration folder), or create Mods/ClusterIntegration/enable_carplay.txt to install the full JAR instead."
         exit 4
+    fi
+    # The Audi JAR shows the video on displayable 62 (its DisplayManagerMIB2High
+    # adds cluster contexts with 62 in place of the map's 33); the daemon built
+    # for it posts there. The release daemon posts on 33 and would stay hidden.
+    if [[ ! -f "$MOD_PATH/aa_only/cluster" ]]; then
+        print -u2 "ERROR: $MOD_PATH/aa_only/cluster not found. Aborting before any change."
+        print -u2 "       The Audi JAR needs the cluster daemon built next to it (modkit/build_sd_package.sh puts it into aa_only/);"
+        print -u2 "       extract the whole Audi zip to an empty card."
+        exit 4
+    fi
+fi
+
+# CarPlay map video in the cockpit on Audi (enable_carplay_altscreen.txt).
+# Needs the Audi JAR (KombiMapGuard switches the cockpit to the video and back)
+# and the dio_manager wrapper, which preloads altscreen.so when it is installed.
+ALTSCREEN=0
+ALT_SRC="$MOD_PATH/altscreen"
+if [[ "$OEM" == "AU" && -e "$MOD_ROOT/enable_carplay_altscreen.txt" ]]; then
+    if [[ $FULL_JAR -eq 1 ]]; then
+        print "WARN: enable_carplay_altscreen.txt needs the Audi JAR and is ignored while enable_carplay.txt is present."
+    elif [[ ! -f "$ALT_SRC/altscreen.so" || ! -f "$ALT_SRC/altscreen_pf.sh" ]]; then
+        print -u2 "ERROR: $ALT_SRC/altscreen.so or altscreen_pf.sh not found. Aborting before any change."
+        print -u2 "       Extract the whole Audi zip to an empty card, or delete enable_carplay_altscreen.txt."
+        exit 4
+    else
+        ALTSCREEN=1
+        CARPLAY_HOOK=1
     fi
 fi
 
@@ -577,15 +640,21 @@ swap_binary_for_wrapper() {
     print "install wrapper:   $dst_active"
 }
 
-# Java classes: on Audi without enable_carplay.txt install the Android-Auto-
-# only JAR (Update/aa_only/*_aa.jar, built by modkit/build_sd_package.sh,
-# presence checked in the preflight). It lacks the CarPlay classes, so the
+# Java classes: on Audi without enable_carplay.txt install the Audi JAR
+# (Update/aa_only/*_aa.jar, built by modkit/build_sd_package.sh, presence
+# checked in the preflight). It lacks the CarPlay DSI manager classes, so the
 # stock CarPlayDSIManager stays in charge of CarPlay and only
-# AndroidAuto2Subsystem is shadowed. The full JAR is used on Porsche and on
-# Audi with enable_carplay.txt.
-if [[ $CARPLAY_HOOK -eq 0 ]]; then
+# AndroidAuto2Subsystem is shadowed; that class also starts the CarPlay
+# cluster integration (turn-by-turn over BAP, fed by the dio_manager hook
+# when enable_carplay_hook.txt is set). The full JAR is used on Porsche and
+# on Audi with enable_carplay.txt.
+if [[ $FULL_JAR -eq 0 ]]; then
     NEW_JAR="$AA_JAR"
-    print "java classes:      Android Auto only (${NEW_JAR##*/}; CarPlay classes not installed)"
+    if [[ $CARPLAY_HOOK -eq 1 ]]; then
+        print "java classes:      Audi JAR (${NEW_JAR##*/}; CarPlay cluster integration started from AndroidAuto2Subsystem, stock CarPlayDSIManager kept)"
+    else
+        print "java classes:      Audi JAR (${NEW_JAR##*/}; CarPlay DSI manager not shadowed)"
+    fi
 else
     print "java classes:      full JAR (${NEW_JAR##*/})"
 fi
@@ -611,7 +680,15 @@ elif [[ $INSTALL_STUB -eq 0 && -f "$STUB_DST" ]]; then
         print -u2 "ERROR: could not back up $STUB_DST to $bk; stand-in left in place"
     fi
 fi
-install_file "$MOD_PATH/cluster"         "$CLUSTER_DIR/cluster"
+# Cluster daemon: with the Audi JAR the build next to it, which posts the
+# video on displayable 62 (checked in the preflight); else the release daemon.
+if [[ $FULL_JAR -eq 0 ]]; then
+    CLUSTER_SRC="$MOD_PATH/aa_only/cluster"
+    print "cluster daemon:    aa_only/cluster (video on displayable 62, for the Audi JAR)"
+else
+    CLUSTER_SRC="$MOD_PATH/cluster"
+fi
+install_file "$CLUSTER_SRC"              "$CLUSTER_DIR/cluster"
 install_file "$MOD_PATH/gal_cluster.so"  "$CLUSTER_DIR/gal_cluster.so"
 install_file "$MOD_PATH/dio_cluster.so"  "$CLUSTER_DIR/dio_cluster.so"
 
@@ -685,6 +762,53 @@ apply_override() {
     return 1
 }
 
+# CarPlay map video in the cockpit (enable_carplay_altscreen.txt, checked in
+# the preflight). The hook goes next to the daemon, the dio_manager wrapper
+# preloads it whenever it is there, and the Persist script starts the packet
+# filter script at every boot. With mirror.mode "fill capture=h264" the daemon
+# decodes the hook's H.264 stream when CarPlay starts instead of mirroring the
+# MMI screen. Without the marker, files left by an earlier run are removed, so
+# the wrapper falls back to dio_cluster.so.
+if [[ $ALTSCREEN -eq 1 ]]; then
+    install_file "$ALT_SRC/altscreen.so"    "$CLUSTER_DIR/altscreen.so"
+    install_file "$ALT_SRC/altscreen_pf.sh" "$CLUSTER_DIR/altscreen_pf.sh"
+    chmod 755 "$CLUSTER_DIR/altscreen.so" "$CLUSTER_DIR/altscreen_pf.sh" 2>/dev/null
+    if apply_override mirror.mode '"fill capture=h264"'; then
+        note "override $CLUSTER_DIR/cluster_config.json mirror.mode=\"fill capture=h264\" (altscreen)"
+        print "carplay altscreen: ON (altscreen.so in dio_manager, TCP 6031 opened at boot, mirror.mode \"fill capture=h264\")"
+    else
+        print "carplay altscreen: WARN could not set mirror.mode in cluster_config.json; the JAR sets it before every start anyway"
+    fi
+    [[ -f "$CLUSTER_DIR/altscreen_off" ]] && print "carplay altscreen: WARN $CLUSTER_DIR/altscreen_off exists, the hook stays passive until it is deleted"
+else
+    typeset af
+    for af in altscreen.so altscreen_pf.sh; do
+        if [[ -f "$CLUSTER_DIR/$af" ]]; then
+            bk="$BACKUP_DIR/$af.backup.$(ts)"
+            cp -p "$CLUSTER_DIR/$af" "$bk" && rm -f "$CLUSTER_DIR/$af" && print "remove altscreen:  $CLUSTER_DIR/$af -> $bk" && note "remove $CLUSTER_DIR/$af backup=$bk"
+        fi
+    done
+    [[ "$OEM" == "AU" ]] && print "carplay altscreen: OFF (create Mods/ClusterIntegration/enable_carplay_altscreen.txt for the CarPlay map video in the cockpit)"
+fi
+
+# Audi defaults for the Android Auto map video. The cluster entry built into
+# gal_cluster.so (modkit/template/template.txt) lays the phone's UI out for a
+# 1920x1080 frame of which the cockpit shows the centre rows, so the daemon
+# has to fill and the hook has to ask the phone for 1080 (gal env below).
+# With the shipped 720 / letter the map is a band with black bars and a hard
+# right edge (seen on an A6 C8; an e-tron owner had set these by hand).
+# config_overrides.txt is applied after this and wins.
+if [[ "$OEM" == "AU" ]]; then
+    for kv in 'gal_h264.codecRes=1080' 'gal_h264.mode="fill"' 'gal_h264.panY=0.0'; do
+        if apply_override "${kv%%=*}" "${kv#*=}"; then
+            print "audi default:      ${kv%%=*} = ${kv#*=}"
+            note "override $CLUSTER_DIR/cluster_config.json $kv (audi default)"
+        else
+            print "audi default:      WARN could not set ${kv%%=*} in cluster_config.json"
+        fi
+    done
+fi
+
 # Per-car config overrides. Mods/ClusterIntegration/config_overrides.txt on
 # the SD card holds "key=value" lines (value written as JSON: true, false,
 # a number, or "a string"; '#' starts a comment). Each key is applied with
@@ -731,30 +855,41 @@ fi
 # on the SD card holds GAL_CLUSTER_*=value lines (insets in codec-frame
 # pixels, GAL_CLUSTER_LOG=1 for live logging, ...); the installer copies the
 # valid lines to $CLUSTER_DIR/gal_env and the gal wrapper exports them before
-# starting gal.real. Without the file an installed gal_env is removed.
+# starting gal.real. On Audi GAL_CLUSTER_RES=1080 is added unless the file
+# sets GAL_CLUSTER_RES itself (it goes with the gal_h264 defaults above).
+# With nothing to install an installed gal_env is removed.
 GAL_ENV_SRC="$MOD_ROOT/gal_env.txt"
 GAL_ENV_DST="$CLUSTER_DIR/gal_env"
+GAL_ENV_STAGE="/tmp/cluster_gal_env.$$"
+rm -f "$GAL_ENV_STAGE"
 if [[ -f "$GAL_ENV_SRC" ]]; then
     awk '{ sub(/\r$/, ""); sub(/[ \t]*#.*$/, ""); gsub(/^[ \t]+|[ \t]+$/, "") }
          /^GAL_CLUSTER_[A-Z0-9_]+=[A-Za-z0-9_.:\/-]*$/ { print; n++ }
-         END { exit (n > 0 ? 0 : 1) }' "$GAL_ENV_SRC" > "/tmp/cluster_gal_env.$$" 2>/dev/null
-    if [[ -s "/tmp/cluster_gal_env.$$" ]]; then
-        # the staged file is new every run, so compare by content, not time
-        files_same "/tmp/cluster_gal_env.$$" "$GAL_ENV_DST"
-        if [[ $? -eq 0 ]]; then
-            print "skip identical:    $GAL_ENV_DST"
-        else
-            install_file "/tmp/cluster_gal_env.$$" "$GAL_ENV_DST" && chmod 644 "$GAL_ENV_DST" 2>/dev/null
-        fi
-        awk '{ printf "gal env:           %s\n", $0 }' "$GAL_ENV_DST"
-    else
-        print "gal env:           WARN gal_env.txt has no valid GAL_CLUSTER_NAME=value line, ignored"
+         END { exit (n > 0 ? 0 : 1) }' "$GAL_ENV_SRC" > "$GAL_ENV_STAGE" 2>/dev/null
+    [[ -s "$GAL_ENV_STAGE" ]] || print "gal env:           WARN gal_env.txt has no valid GAL_CLUSTER_NAME=value line, ignored"
+fi
+if [[ "$OEM" == "AU" ]]; then
+    galres=0
+    [[ -s "$GAL_ENV_STAGE" ]] && awk '/^GAL_CLUSTER_RES=/ { f = 1 } END { exit (f ? 0 : 1) }' "$GAL_ENV_STAGE" && galres=1
+    if [[ $galres -eq 0 ]]; then
+        print "GAL_CLUSTER_RES=1080" >> "$GAL_ENV_STAGE"
+        print "audi default:      GAL_CLUSTER_RES=1080 (gal env)"
     fi
-    rm -f "/tmp/cluster_gal_env.$$"
+fi
+if [[ -s "$GAL_ENV_STAGE" ]]; then
+    # the staged file is new every run, so compare by content, not time
+    files_same "$GAL_ENV_STAGE" "$GAL_ENV_DST"
+    if [[ $? -eq 0 ]]; then
+        print "skip identical:    $GAL_ENV_DST"
+    else
+        install_file "$GAL_ENV_STAGE" "$GAL_ENV_DST" && chmod 644 "$GAL_ENV_DST" 2>/dev/null
+    fi
+    awk '{ printf "gal env:           %s\n", $0 }' "$GAL_ENV_DST"
 elif [[ -f "$GAL_ENV_DST" ]]; then
     bk="$BACKUP_DIR/gal_env.backup.$(ts)"
     cp -p "$GAL_ENV_DST" "$bk" && rm -f "$GAL_ENV_DST" && print "remove gal env:    $GAL_ENV_DST -> $bk" && note "remove $GAL_ENV_DST backup=$bk"
 fi
+rm -f "$GAL_ENV_STAGE"
 
 # Daemon log. Mods/ClusterIntegration/daemon_log.txt on the card installs the
 # marker $CLUSTER_DIR/daemon_verbose; the Persist script and the gal wrapper
@@ -793,7 +928,7 @@ else
             print "restore original:  $APPS_DIR/dio_manager.real -> $APPS_DIR/dio_manager (carplay hook disabled)" && \
             note "restore $APPS_DIR/dio_manager from=$APPS_DIR/dio_manager.real"
     fi
-    print "carplay hook:      OFF (Audi default; create Mods/ClusterIntegration/enable_carplay.txt to install it)"
+    print "carplay hook:      OFF (Audi default; create Mods/ClusterIntegration/enable_carplay_hook.txt to install it with the Audi JAR)"
 fi
 
 # Diagnostic mode. If Mods/ClusterIntegration/diag.txt exists on the SD card,
@@ -908,6 +1043,26 @@ check_hook_symbols() {
 }
 check_hook_symbols
 [[ -n "$LSD_TAIL" && "$LSD_TAIL" != "$LSD_DIR/lsd.jar" ]] && rm -f "$LSD_TAIL"
+
+# Persist script: the ModKit copies Mods/<mod>/Persist with "cp -rf" after this
+# script. On a card written by macOS (FAT32) the QNX driver sees a bogus "..."
+# directory entry and that copy fails with "Filename too long", so the cluster
+# daemon would never be started at boot. Copy the one file by explicit path
+# here; the ModKit's own attempt afterwards may still fail and does no harm.
+PERSIST_SRC="$MOD_ROOT/Persist/install.sh"
+PERSIST_DST="/mnt/ota/modkit/Mods/${MOD_ROOT##*/}/Persist"
+if [[ -f "$PERSIST_SRC" ]]; then
+    if [[ ! -e /mnt/ota ]]; then mount -t qnx6 /dev/mnanda0t177.16 /mnt/ota 2>/dev/null; fi
+    mount -uw /mnt/ota 2>/dev/null
+    if mkdir -p "$PERSIST_DST" 2>/dev/null && cp -f "$PERSIST_SRC" "$PERSIST_DST/install.sh" 2>/dev/null; then
+        chmod 755 "$PERSIST_DST/install.sh" 2>/dev/null
+        print "persist script:    copied to $PERSIST_DST/install.sh (explicit path)"
+    else
+        print "persist script:    WARN could not copy $PERSIST_SRC to $PERSIST_DST"
+    fi
+else
+    print "persist script:    $PERSIST_SRC not visible to the unit"
+fi
 
 sync
 print ""

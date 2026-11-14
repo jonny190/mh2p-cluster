@@ -34,3 +34,11 @@ if [[ -x "/eso/bin/apps/cluster/cluster" ]]; then
         fi
 fi
 
+# CarPlay cluster video (enable_carplay_altscreen.txt): the iPhone streams it
+# to TCP 6031, which Audi's packet filter blocks. The script waits for the
+# filter and then keeps the port open, so it runs in the background.
+if [[ -x "/eso/bin/apps/cluster/altscreen_pf.sh" ]]; then
+        /eso/bin/apps/cluster/altscreen_pf.sh >/dev/null 2>&1 &
+        print "persist: started altscreen_pf.sh pid $!" >> "$DAEMON_LOG" 2>/dev/null
+fi
+

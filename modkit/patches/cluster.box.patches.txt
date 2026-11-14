@@ -1,0 +1,41 @@
+# Optional byte patch for Update/cluster (v0034 beta2 candidate 90d0b76): a
+# centred, fixed-size box for the screen mirror (capture=display, mode=native).
+# Not applied by default; build with
+#   CLUSTER_EXTRA_PATCHES=modkit/patches/cluster.box.patches.txt modkit/build_sd_package.sh ...
+#
+# Why: on Audi MH2p the mirror captures the surface of both MMI screens side by
+# side (A6 C8: 2820x720 = 1540 upper + 1280 lower) into a 1920x720 pixmap, and
+# the cockpit window is 1920x722. zoomX/panX can cut out the upper screen, but
+# every mode draws the quad over the full window width, so the 1540-wide
+# screen is stretched to 1920. mode=native would draw cap/DISP sized, which is
+# 1920/1920 here and therefore also full width.
+#
+# What: in the display path's native branch (src/cluster.c, mode "native":
+# qx = cap_w / DISP_W; qy = cap_h / DISP_H) the two divisions are replaced by
+# constants, so mode=native draws a centred box of qx * window width by
+# qy * window height, black around it. zoomX/zoomY/panX/panY still select the
+# source rectangle, so with mode=native zoomX=1.831 panX=-0.416 the box shows
+# the upper MMI screen. The h264 path (Android Auto) has its own native branch
+# and is not touched.
+#
+# Box size: qx and qy are VFP immediates (vmov.f32 imm8: +-(16..31)/16 * 2^r,
+# r = -3..4), so between 0.125 and 1.0 the step is 1/128 below 0.25, 1/64 up to
+# 0.5 and 1/32 above. The upper A6 C8 screen is 1540x720 (2.139:1);
+# qx*1920 / (qy*722) should match it.
+#   name    qx        qy        box       s0 bytes  s19 bytes
+#   full    0.8125    1.0       1560x722  b6ee0a0a  f7ee009a
+#   large   0.75      0.9375    1440x677  b6ee080a  f6ee0e9a
+#   medium  0.625     0.78125   1200x564  b6ee040a  f6ee099a
+#   small   0.59375   0.75      1140x542  b6ee030a  f6ee089a
+#   xs1     0.53125   0.65625   1020x474  b6ee010a  f6ee059a
+#   xs2     0.5       0.625      960x451  b6ee000a  f6ee049a
+#   xs3     0.40625   0.5        780x361  b5ee0a0a  f6ee009a
+#   xs4     0.375     0.46875    720x338  b5ee080a  f5ee0e9a
+#   xs5     0.3125    0.390625   600x282  b5ee040a  f5ee099a
+# Prepared for an A6 C8 (MH2p_ER_AUG35_P2711). The patched instructions were
+# checked with llvm-objdump (thumbv7, vfp3); medium, full and small were run
+# on the car.
+#   vdiv.f32 s0, s24, s23   (qx = cap_w / DISP_W)  -> vmov.f32 s0,  #0.625
+#   vdiv.f32 s19, s22, s21  (qy = cap_h / DISP_H)  -> vmov.f32 s19, #0.78125
+0x3520  8cee2b0a  b6ee040a  # mirror native mode: box width  = 0.625 of the window
+0x3528  cbee2a9a  f6ee099a  # mirror native mode: box height = 0.78125 of the window

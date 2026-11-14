@@ -13,7 +13,8 @@
 # - Restores original gal binary: removes wrapper at /mnt/app/eso/bin/apps/gal
 #   and moves gal.real back to gal.
 # - Same for dio_manager.
-# - Backs up and removes JAR + native binaries from their install dirs
+# - Backs up and removes JAR + native binaries (altscreen.so and its packet
+#   filter script included) from their install dirs
 #   (every ClusterIntegration_* jar, which includes the Audi stand-in jar
 #   ClusterIntegration_StorageMountHandler_stub.jar).
 # - If NAME.real is missing but NAME is still our wrapper, restores the
@@ -68,6 +69,26 @@ for proc in cluster gal gal.real dio_manager dio_manager.real; do
         print "slay:              $proc"
     fi
 done
+
+# Persisted copy of Mods/ClusterIntegration/Persist under /mnt/ota (placed there by
+# the ModKit, or by install.sh's explicit copy on cards written by macOS). Without
+# this the boot-time script would keep looking for a daemon that no longer exists.
+PERSIST_DIR="/mnt/ota/modkit/Mods/${MOD_PATH%/*}"
+PERSIST_DIR="/mnt/ota/modkit/Mods/${PERSIST_DIR##*/}"
+if [[ -d "$PERSIST_DIR" ]]; then
+    mount -uw /mnt/ota 2>/dev/null
+    rm -rf "$PERSIST_DIR" 2>/dev/null && print "remove persist:    $PERSIST_DIR" || print "WARN: could not remove $PERSIST_DIR"
+fi
+# The "Carplay Map" setting of the cockpit navigation menu (CarPlayMapSetting).
+if [[ -f /mnt/ota/modkit/carplay_map.txt ]]; then
+    mount -uw /mnt/ota 2>/dev/null
+    rm -f /mnt/ota/modkit/carplay_map.txt && print "remove:            /mnt/ota/modkit/carplay_map.txt"
+fi
+# The CarPlay map zoom the altScreen hook keeps across restarts (zoom_restore).
+if [[ -f /mnt/ota/modkit/altscreen_zoom.txt ]]; then
+    mount -uw /mnt/ota 2>/dev/null
+    rm -f /mnt/ota/modkit/altscreen_zoom.txt && print "remove:            /mnt/ota/modkit/altscreen_zoom.txt"
+fi
 print ""
 
 # Reverse of swap_binary_for_wrapper. If NAME.real exists, remove the
@@ -130,6 +151,13 @@ backup_and_remove "$CLUSTER_DIR/cluster"
 backup_and_remove "$CLUSTER_DIR/gal_cluster.so"
 backup_and_remove "$CLUSTER_DIR/dio_cluster.so"
 backup_and_remove "$CLUSTER_DIR/cluster_config.json"
+# CarPlay map video (enable_carplay_altscreen.txt); altscreen.conf is the
+# optional per-car tuning file, kept in Backup/ like the rest. The packet
+# filter rule for TCP 6031 is gone after the next restart.
+backup_and_remove "$CLUSTER_DIR/altscreen.so"
+backup_and_remove "$CLUSTER_DIR/altscreen_pf.sh"
+[[ -f "$CLUSTER_DIR/altscreen.conf" ]] && backup_and_remove "$CLUSTER_DIR/altscreen.conf"
+[[ -f "$CLUSTER_DIR/altscreen_off" ]] && rm -f "$CLUSTER_DIR/altscreen_off" && print "remove:            $CLUSTER_DIR/altscreen_off" && note "remove $CLUSTER_DIR/altscreen_off"
 [[ -f "$CLUSTER_DIR/diag_mode" ]] && rm -f "$CLUSTER_DIR/diag_mode" && print "remove:            $CLUSTER_DIR/diag_mode" && note "remove $CLUSTER_DIR/diag_mode"
 [[ -f "$CLUSTER_DIR/daemon_verbose" ]] && rm -f "$CLUSTER_DIR/daemon_verbose" && print "remove:            $CLUSTER_DIR/daemon_verbose" && note "remove $CLUSTER_DIR/daemon_verbose"
 

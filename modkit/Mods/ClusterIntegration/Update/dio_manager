@@ -15,6 +15,13 @@
 DIO_PRELOAD="/mnt/app/eso/bin/apps/cluster/dio_cluster.so"
 DIO_PRELOAD_LOG="/tmp/dio_preload.log"
 
+# Audi with enable_carplay_altscreen.txt: the installer puts altscreen.so
+# (CarPlay instrument-cluster video) next to dio_cluster.so, and it is
+# preloaded instead of it.
+if [ -f /mnt/app/eso/bin/apps/cluster/altscreen.so ]; then
+    DIO_PRELOAD="/mnt/app/eso/bin/apps/cluster/altscreen.so"
+fi
+
 echo -e "\ndio_date: $(date)"  >> $DIO_PRELOAD_LOG
 
 if [ -f $DIO_PRELOAD ]; then
